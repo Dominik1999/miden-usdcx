@@ -266,3 +266,90 @@ pub fn read_attester_status(faucet: &Account, pk_comm: Word) -> anyhow::Result<W
     let value = faucet.storage().get_map_item(&slot_name, pk_comm)?;
     Ok(value)
 }
+
+/// Creates a USDCx faucet with a custom set of attester PK_COMMitments.
+#[allow(dead_code)]
+///
+/// Similar to `create_test_usdcx_faucet_existing` but allows specifying which
+/// attester public key commitments to register.
+pub fn create_test_usdcx_faucet_existing_with_attesters(
+    owner_id: AccountId,
+    attesters: Vec<Word>,
+) -> anyhow::Result<Account> {
+    let token_name = TokenName::new("USDCx")?;
+    let token_symbol = miden_protocol::asset::TokenSymbol::new("USDCX")?;
+
+    let faucet = FungibleFaucet::builder()
+        .name(token_name)
+        .symbol(token_symbol)
+        .decimals(6)
+        .max_supply(AssetAmount::try_from(TEST_MAX_SUPPLY)?)
+        .build()?;
+
+    let attester_registry = AttesterRegistry::new(attesters)
+        .expect("at least one attester is required");
+    let nonce_registry = NonceRegistry::new();
+    let domain_config = DomainConfig::new(TEST_DOMAIN_ID, TEST_MIN_BURN_SIZE);
+    let mint_policy = UsdcxMintPolicy::new(attester_registry, nonce_registry, domain_config);
+    let burn_policy = UsdcxBurnPolicy::new();
+
+    let token_policy_manager = TokenPolicyManager::new()
+        .with_mint_policy(
+            MintPolicyConfig::Custom(UsdcxMintPolicy::check_policy_root().as_word()),
+            PolicyRegistration::Active,
+        )?
+        .with_burn_policy(
+            BurnPolicyConfig::Custom(UsdcxBurnPolicy::check_policy_root().as_word()),
+            PolicyRegistration::Active,
+        )?
+        .with_send_policy(TransferPolicy::Blocklist, PolicyRegistration::Active)?
+        .with_receive_policy(TransferPolicy::Blocklist, PolicyRegistration::Active)?;
+
+    let access_control = AccessControl::Ownable2Step { owner: owner_id };
+
+    let account = AccountBuilder::new([0u8; 32])
+        .account_type(AccountType::Public)
+        .with_auth_component(NoAuth::new())
+        .with_component(faucet)
+        .with_components(access_control)
+        .with_components(token_policy_manager)
+        .with_component(PausableManager)
+        .with_component(mint_policy)
+        .with_component(burn_policy)
+        .with_component(BlocklistOwnerControlled)
+        .build_existing()?;
+
+    Ok(account)
+}
+
+/// Returns the compiled MASM library for the PausableManager component.
+pub fn pausable_manager_library() -> Library {
+    PausableManager::code().as_library().clone()
+}
+
+/// Creates a note that calls `pause` on the faucet.
+///
+/// The note sender must be the faucet owner for the call to succeed.
+pub fn create_pause_note(
+    sender: AccountId,
+    rng: &mut SmallRng,
+    source_manager: Arc<dyn SourceManagerSync>,
+) -> anyhow::Result<Note> {
+    let script = r#"
+        use miden::standards::components::access::pausable::manager->faucet_account
+        @note_script
+        pub proc main
+            padw padw padw padw
+            call.faucet_account::pause
+            dropw dropw dropw dropw
+        end
+    "#;
+
+    let note = NoteBuilder::new(sender, &mut *rng)
+        .source_manager(source_manager)
+        .dynamically_linked_libraries([pausable_manager_library()])
+        .code(script)
+        .build()?;
+
+    Ok(note)
+}

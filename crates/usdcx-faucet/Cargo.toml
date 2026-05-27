@@ -13,11 +13,13 @@ miden-standards = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+miden-processor = { workspace = true }
 miden-testing = { workspace = true }
 miden-tx = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 rand = "0.9"
+rand_chacha = { workspace = true }
 
 [[test]]
 name = "integration"

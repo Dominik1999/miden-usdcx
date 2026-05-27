@@ -4062,11 +4062,13 @@ dependencies = [
  "anyhow",
  "miden-assembly 0.15.0",
  "miden-core 0.15.0",
+ "miden-processor",
  "miden-protocol",
  "miden-standards",
  "miden-testing",
  "miden-tx",
  "rand 0.9.4",
+ "rand_chacha",
  "thiserror 2.0.18",
  "tokio",
 ]
