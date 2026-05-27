@@ -23,7 +23,7 @@ const USDCX_MINT_POLICY_MASM: &str = "
     use miden::protocol::native_account
     use miden::standards::access::ownable2step
     use miden::standards::access::pausable
-    use miden::core::crypto::dsa::ecdsa_k256_keccak
+    use miden::core::crypto::dsa::falcon512_poseidon2
     use miden::core::crypto::hashes::poseidon2
 
     # CONSTANTS
@@ -38,7 +38,6 @@ const USDCX_MINT_POLICY_MASM: &str = "
     # Well-known advice map key for the attestation data (PK_COMM + NONCE).
     # The relayer puts [pk0, pk1, pk2, pk3, n0, n1, n2, n3] under this key
     # in the advice map before building the transaction.
-    # Uses a distinctive value unlikely to collide with kernel advice map entries.
     const ATTESTATION_DATA_KEY=[3735928559, 3405691582, 3735928559, 3405691582]
 
     const ERR_ATTESTER_NOT_APPROVED=\"attester public key commitment not in registry\"
@@ -49,10 +48,10 @@ const USDCX_MINT_POLICY_MASM: &str = "
 
     #! Mint policy check invoked via dynexec by the TokenPolicyManager.
     #!
-    #! Verifies an ECDSA secp256k1 attestation from the advice provider before
-    #! allowing the mint to proceed. The attestation data is read from the advice
-    #! stack (PK_COMM, NONCE) and the signature is read from the advice map keyed
-    #! by merge(PK_COMM, MESSAGE).
+    #! Verifies a Falcon512 attestation from the advice provider before
+    #! allowing the mint to proceed. The attestation data is read from the
+    #! advice stack (PK_COMM, NONCE) and the signature is read from the
+    #! advice map keyed by merge(PK_COMM, MESSAGE).
     #!
     #! Inputs:  [amount, tag, note_type, RECIPIENT]
     #! Outputs: [amount, tag, note_type, RECIPIENT]
@@ -60,25 +59,92 @@ const USDCX_MINT_POLICY_MASM: &str = "
     #! Panics if:
     #! - the attester PK_COMM is not in the approved attesters registry.
     #! - the deposit nonce has already been used.
-    #! - the ECDSA signature verification fails.
+    #! - the Falcon512 signature verification fails.
     #!
     #! Invocation: dynexec
     pub proc check_policy
-        # Stack: [amount, tag, note_type, RECIPIENT]
-        #
-        # TODO: Full attestation verification is deferred pending resolution of
-        # a stack-position debugging issue in the ECDSA message computation.
-        # The MASM structure for attestation verification is documented above
-        # (ATTESTATION_DATA_KEY, advice map protocol, poseidon2::merge, and
-        # ecdsa_k256_keccak::verify). The Rust-side advice builder and test
-        # infrastructure are in place; what remains is verifying the exact
-        # stack offsets during dynexec so the MASM MESSAGE matches the
-        # Rust-side signature.
-        #
-        # For now, this is a pass-through: the TokenPolicyManager already
-        # checks the pause guard before dynexec, so the minting flow is
-        # gated only by pause status.
-        push.0 drop
+        # Stack: [amount, tag, note_type, RECIPIENT(4)]
+
+        # 1. Load attestation data (PK_COMM + NONCE) from advice map
+        push.ATTESTATION_DATA_KEY
+        adv.push_mapval
+        dropw
+        # => [amount, tag, note_type, RECIPIENT(4)]
+
+        # 2. Read PK_COMM from the advice stack
+        padw adv_loadw
+        # => [PK_COMM(4), amount, tag, note_type, RECIPIENT(4)]
+
+        # 3. Verify the attester is in the approved registry
+        dupw
+        push.ATTESTERS_SLOT[0..2]
+        exec.active_account::get_map_item
+        # => [VALUE(4), PK_COMM, amount, tag, note_type, RECIPIENT]
+        # get_map_item returns VALUE reversed on stack
+        # Stored [1,0,0,0] appears as [0,0,0,1]; check VALUE[3]
+        movdn.3 drop drop drop
+        # => [is_approved, PK_COMM, amount, tag, note_type, RECIPIENT]
+        assert.err=ERR_ATTESTER_NOT_APPROVED
+        # => [PK_COMM, amount, tag, note_type, RECIPIENT]
+
+        # 4. Read NONCE from the advice stack
+        padw adv_loadw
+        # => [NONCE(4), PK_COMM(4), amount, tag, note_type, RECIPIENT(4)]
+
+        # 5. Check nonce has not been used
+        dupw
+        push.NONCES_SLOT[0..2]
+        exec.active_account::get_map_item
+        # => [NONCE_VAL(4), NONCE, PK_COMM, amount, tag, note_type, RECIPIENT]
+        # Nonce val stored as [1,0,0,0] appears reversed; check VALUE[3]
+        movdn.3 drop drop drop
+        # => [nonce_val_last, NONCE, PK_COMM, amount, tag, note_type, RECIPIENT]
+        assertz.err=ERR_NONCE_ALREADY_USED
+        # => [NONCE, PK_COMM, amount, tag, note_type, RECIPIENT]
+
+        # 6. Mark nonce as used in storage
+        # set_map_item needs [slot_suffix, slot_prefix, KEY, VALUE]
+        # VALUE = NONCE_USED = [1,0,0,0] but we need to store it reversed
+        # Actually, let's just store [1,0,0,0] and the read reversal is consistent
+        dupw
+        push.NONCE_USED swapw
+        push.NONCES_SLOT[0..2]
+        exec.native_account::set_map_item
+        dropw
+        # => [NONCE, PK_COMM, amount, tag, note_type, RECIPIENT]
+
+        # 7. Compute MESSAGE = merge(NONCE, [amount, domain_id, 0, 0])
+        push.DOMAIN_CONFIG_SLOT[0..2]
+        exec.active_account::get_item
+        # => [CONFIG_WORD(4), NONCE, PK_COMM, amount, tag, note_type, RECIPIENT]
+        # CONFIG_WORD is also reversed on stack: stored [domain_id, min_burn, 0, 0]
+        # appears as [0, 0, min_burn, domain_id] on stack
+        # domain_id is at position 3 of the returned word
+        movdn.3 drop drop drop
+        # => [domain_id, NONCE(4), PK_COMM(4), amount, tag, note_type, RECIPIENT(4)]
+
+        # Build AMOUNT_WORD = [amount, domain_id, 0, 0]
+        dup.9 swap push.0 push.0
+        movup.3 movup.3 swap
+        # => [amount, domain_id, 0, 0, NONCE, PK_COMM, amount, tag, note_type, RECIPIENT]
+
+        swapw
+        exec.poseidon2::merge
+        # => [MESSAGE(4), PK_COMM(4), amount, tag, note_type, RECIPIENT(4)]
+
+        # 8. Verify Falcon512 signature (following x402 pattern)
+        swapw
+        # => [PK_COMM, MESSAGE, amount, tag, note_type, RECIPIENT]
+
+        dupw.1 dupw.1
+        exec.poseidon2::merge
+        # => [SIG_KEY(4), PK_COMM, MESSAGE, amount, tag, note_type, RECIPIENT]
+
+        adv.push_mapval
+        dropw
+        # => [PK_COMM, MESSAGE, amount, tag, note_type, RECIPIENT]
+
+        exec.falcon512_poseidon2::verify
         # => [amount, tag, note_type, RECIPIENT]
     end
 

@@ -5,13 +5,15 @@ use std::sync::Arc;
 use miden_protocol::account::{
     Account, AccountBuilder, AccountId, AccountType, StorageSlotName,
 };
+use miden_protocol::account::auth::AuthSecretKey;
 use miden_protocol::assembly::Library;
 use miden_protocol::assembly::DefaultSourceManager;
 use miden_protocol::assembly::debuginfo::SourceManagerSync;
 use miden_protocol::asset::AssetAmount;
 use miden_protocol::note::Note;
 use miden_protocol::testing::account_id::AccountIdBuilder;
-use miden_protocol::{Felt, Word, ZERO};
+use miden_protocol::vm::AdviceInputs;
+use miden_protocol::{Felt, Hasher, Word, ZERO};
 use miden_standards::account::access::{AccessControl, PausableManager};
 use miden_standards::account::auth::NoAuth;
 use miden_standards::account::faucets::{FungibleFaucet, TokenName};
@@ -23,6 +25,7 @@ use miden_standards::testing::note::NoteBuilder;
 use miden_testing::MockChain;
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
+use rand_chacha::ChaCha20Rng;
 use usdcx_faucet::burn_policy::UsdcxBurnPolicy;
 use usdcx_faucet::domain_config::DomainConfig;
 use usdcx_faucet::mint_policy::UsdcxMintPolicy;
@@ -40,6 +43,9 @@ pub const TEST_MAX_SUPPLY: u64 = 1_000_000_000_000;
 // ================================================================================================
 
 /// Creates a deterministic `PK_COMM` word for testing, keyed by `index`.
+///
+/// NOTE: This creates a fake PK_COMM that does NOT correspond to a real key pair.
+/// Use `make_attester_keypair` + `attester_pk_comm` for real attestation tests.
 pub fn mock_attester_pk_comm(index: u8) -> Word {
     Word::new([
         Felt::new_unchecked(index as u64 + 1),
@@ -47,6 +53,75 @@ pub fn mock_attester_pk_comm(index: u8) -> Word {
         Felt::new_unchecked(index as u64 + 3),
         ZERO,
     ])
+}
+
+// ATTESTATION HELPERS
+// ================================================================================================
+
+/// Generates a deterministic Falcon512 attester key pair from a seed.
+pub fn make_attester_keypair(seed: u64) -> AuthSecretKey {
+    let mut rng = ChaCha20Rng::seed_from_u64(seed);
+    AuthSecretKey::new_falcon512_poseidon2_with_rng(&mut rng)
+}
+
+/// Extracts the public key commitment (Word) from an attester secret key.
+pub fn attester_pk_comm(sk: &AuthSecretKey) -> Word {
+    sk.public_key().to_commitment().into()
+}
+
+/// Computes the deposit message: merge(NONCE, [amount, domain_id, 0, 0]).
+///
+/// This must match the MASM computation in check_policy exactly.
+pub fn deposit_message(nonce: Word, amount: u64, domain_id: u32) -> Word {
+    let amount_word = Word::new([
+        Felt::new_unchecked(amount),
+        Felt::new_unchecked(domain_id as u64),
+        ZERO,
+        ZERO,
+    ]);
+    Hasher::merge(&[nonce, amount_word])
+}
+
+/// The well-known advice map key for attestation data (PK_COMM + NONCE).
+/// Must match `ATTESTATION_DATA_KEY` in the MASM.
+pub const ATTESTATION_DATA_KEY: Word = Word::new([
+    Felt::new_unchecked(3735928559),
+    Felt::new_unchecked(3405691582),
+    Felt::new_unchecked(3735928559),
+    Felt::new_unchecked(3405691582),
+]);
+
+/// Builds advice inputs for attestation verification in check_policy.
+///
+/// The advice map carries:
+/// - `ATTESTATION_DATA_KEY` -> [PK_COMM(4), NONCE(4)]
+/// - `merge(PK_COMM, MESSAGE)` -> prepared Falcon512 signature
+pub fn attestation_advice(
+    attester_sk: &AuthSecretKey,
+    nonce: Word,
+    amount: u64,
+    domain_id: u32,
+) -> AdviceInputs {
+    let pk_comm = attester_pk_comm(attester_sk);
+    let message = deposit_message(nonce, amount, domain_id);
+
+    // Sign the message
+    let sig = attester_sk.sign(message);
+    let prepared = sig.to_prepared_signature(message);
+
+    // Compute the advice map key for the signature: merge(PK_COMM, MESSAGE)
+    let sig_key = Hasher::merge(&[pk_comm, message]);
+
+    // Build the attestation data value: [pk0, pk1, pk2, pk3, n0, n1, n2, n3]
+    let mut attestation_data: Vec<Felt> = Vec::new();
+    attestation_data.extend(pk_comm.as_elements());
+    attestation_data.extend(nonce.as_elements());
+
+    AdviceInputs::default()
+        .with_map([
+            (ATTESTATION_DATA_KEY, attestation_data),
+            (sig_key, prepared),
+        ])
 }
 
 /// Creates a USDCx faucet as an "existing" account suitable for MockChain.
