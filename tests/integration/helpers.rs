@@ -1,6 +1,9 @@
 // Shared test helpers for USDCx integration tests.
 
+use miden_protocol::account::{Account, AccountId};
 use miden_protocol::{Felt, Word, ZERO};
+use miden_standards::AuthMethod;
+use usdcx_faucet::faucet::{UsdcxFaucetConfig, UsdcxFaucetError, create_usdcx_faucet};
 
 // CONSTANTS
 // ================================================================================================
@@ -25,17 +28,22 @@ pub fn mock_attester_pk_comm(index: u8) -> Word {
     ])
 }
 
-// TODO(Task 7): Uncomment once `create_usdcx_faucet` is implemented in
-// `usdcx_faucet::faucet`.
-//
-// use miden_protocol::account::{Account, AccountId};
-// use usdcx_faucet::{
-//     domain_config::DomainConfig,
-//     faucet::create_usdcx_faucet,
-// };
-//
-// /// Creates a USDCx faucet with default test configuration.
-// pub fn create_test_usdcx_faucet(owner_id: AccountId) -> anyhow::Result<Account> {
-//     let domain_config = DomainConfig::new(TEST_DOMAIN_ID, TEST_MIN_BURN_SIZE);
-//     create_usdcx_faucet(owner_id, domain_config, TEST_MAX_SUPPLY)
-// }
+/// Creates a USDCx faucet with default test configuration.
+///
+/// Uses `TEST_DOMAIN_ID`, `TEST_MIN_BURN_SIZE`, and `TEST_MAX_SUPPLY` as defaults.
+/// The faucet is created with `AuthMethod::NoAuth` for simplicity in tests.
+/// A single deterministic attester (index 0) is registered.
+pub fn create_test_usdcx_faucet(
+    owner_id: AccountId,
+) -> Result<Account, UsdcxFaucetError> {
+    let config = UsdcxFaucetConfig {
+        init_seed: [0u8; 32],
+        max_supply: TEST_MAX_SUPPLY,
+        owner: owner_id,
+        auth_method: AuthMethod::NoAuth,
+        domain_id: TEST_DOMAIN_ID,
+        min_burn_size: TEST_MIN_BURN_SIZE,
+        initial_attesters: vec![mock_attester_pk_comm(0)],
+    };
+    create_usdcx_faucet(config)
+}
