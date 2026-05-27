@@ -1,0 +1,23 @@
+[package]
+name = "usdcx-faucet"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+miden-assembly = { workspace = true }
+miden-core = { workspace = true }
+miden-protocol = { workspace = true }
+miden-standards = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+miden-testing = { workspace = true }
+miden-tx = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+
+[[test]]
+name = "integration"
+path = "../../tests/integration/main.rs"
