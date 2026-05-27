@@ -21,26 +21,118 @@ pub const USDCX_MINT_POLICY_NAME: &str = "usdcx::components::mint_policy";
 ///
 /// Procedure bodies are stubs; full implementations are deferred to Task 12.
 const USDCX_MINT_POLICY_MASM: &str = "
-    #! USDCx Mint Policy - verifies deposit attestations and mints tokens.
+    use miden::protocol::active_account
+    use miden::protocol::native_account
+    use miden::standards::access::ownable2step
+    use miden::standards::access::pausable
 
+    # CONSTANTS
+    # ============================================================================================
+
+    const ATTESTERS_SLOT=word(\"usdcx::attesters\")
+    const NONCES_SLOT=word(\"usdcx::used_nonces\")
+    const DOMAIN_CONFIG_SLOT=word(\"usdcx::domain_config\")
+    const NONCE_USED=[1, 0, 0, 0]
+    const ATTESTER_ACTIVE=[1, 0, 0, 0]
+
+    const ERR_ATTESTER_NOT_APPROVED=\"attester public key commitment not in registry\"
+    const ERR_NONCE_ALREADY_USED=\"deposit intent nonce has already been used\"
+
+    # PROCEDURES
+    # ============================================================================================
+
+    #! Mint policy check invoked via dynexec by the TokenPolicyManager.
+    #!
+    #! For the initial implementation this is a pass-through (permissionless minting).
+    #! Full ECDSA attestation verification will be added in a follow-up.
+    #!
+    #! Inputs:  [amount, tag, note_type, RECIPIENT]
+    #! Outputs: [amount, tag, note_type, RECIPIENT]
+    #!
+    #! Invocation: dynexec
     pub proc check_policy
-        # stub - always succeeds
-        push.1 drop
+        # Pass-through: the policy manager already checks the pause guard before
+        # calling dynexec, so no additional checks are needed here for MVP.
+        push.0 drop
+        # => [amount, tag, note_type, RECIPIENT]
     end
 
+    #! Mint tokens after verifying an attestation (called from a tx script).
+    #!
+    #! Inputs:  [recipient_id, relayer_id, fee_amount]
+    #! Outputs: []
+    #!
+    #! Invocation: exec
     pub proc mint_with_attestation
-        # stub - wraps check_policy + fee-splitting mint
-        push.1 drop
+        # TODO: Full attestation verification (ECDSA + nonce + domain checks),
+        # then invoke mint with fee split between recipient and relayer.
+        push.0 drop
     end
 
+    #! Add an attester to the approved attesters storage map.
+    #!
+    #! The caller must be the faucet owner.
+    #!
+    #! Inputs:  [PK_COMM, pad(12)]
+    #! Outputs: [pad(16)]
+    #!
+    #! Panics if:
+    #! - the note sender is not the owner.
+    #!
+    #! Invocation: call
     pub proc add_attester
-        # stub - owner-gated attester management
-        push.1 drop
+        exec.ownable2step::assert_sender_is_owner
+        # => [PK_COMM, pad(12)]
+
+        # VALUE = ATTESTER_ACTIVE = [1, 0, 0, 0]
+        push.ATTESTER_ACTIVE
+        # => [ATTESTER_ACTIVE, PK_COMM, pad(12)]
+
+        # Rearrange: set_map_item needs [slot_suffix, slot_prefix, KEY, VALUE]
+        swapw
+        # => [PK_COMM, ATTESTER_ACTIVE, pad(12)]
+
+        push.ATTESTERS_SLOT[0..2]
+        # => [slot_suffix, slot_prefix, PK_COMM, ATTESTER_ACTIVE, pad(12)]
+
+        exec.native_account::set_map_item
+        # => [OLD_VALUE, pad(12)]
+
+        dropw
+        # => [pad(12)]
     end
 
+    #! Remove an attester from the approved attesters storage map.
+    #!
+    #! The caller must be the faucet owner. Writes the zero word for the
+    #! attester key, effectively removing it from the map.
+    #!
+    #! Inputs:  [PK_COMM, pad(12)]
+    #! Outputs: [pad(16)]
+    #!
+    #! Panics if:
+    #! - the note sender is not the owner.
+    #!
+    #! Invocation: call
     pub proc remove_attester
-        # stub - owner-gated attester removal
-        push.1 drop
+        exec.ownable2step::assert_sender_is_owner
+        # => [PK_COMM, pad(12)]
+
+        # Write zero word to remove the attester from the map.
+        padw
+        # => [ZERO_WORD, PK_COMM, pad(12)]
+
+        swapw
+        # => [PK_COMM, ZERO_WORD, pad(12)]
+
+        push.ATTESTERS_SLOT[0..2]
+        # => [slot_suffix, slot_prefix, PK_COMM, ZERO_WORD, pad(12)]
+
+        exec.native_account::set_map_item
+        # => [OLD_VALUE, pad(12)]
+
+        dropw
+        # => [pad(12)]
     end
 ";
 
