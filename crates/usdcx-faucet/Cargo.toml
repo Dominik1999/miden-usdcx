@@ -17,6 +17,7 @@ miden-testing = { workspace = true }
 miden-tx = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
+rand = "0.9"
 
 [[test]]
 name = "integration"

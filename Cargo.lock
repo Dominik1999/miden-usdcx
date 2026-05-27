@@ -4066,6 +4066,7 @@ dependencies = [
  "miden-standards",
  "miden-testing",
  "miden-tx",
+ "rand 0.9.4",
  "thiserror 2.0.18",
  "tokio",
 ]
