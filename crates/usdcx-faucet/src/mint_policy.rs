@@ -21,6 +21,8 @@ pub const USDCX_MINT_POLICY_NAME: &str = "usdcx::components::mint_policy";
 const USDCX_MINT_POLICY_MASM: &str = "
     use miden::protocol::active_account
     use miden::protocol::native_account
+    use miden::protocol::output_note
+    use miden::protocol::faucet
     use miden::standards::access::ownable2step
     use miden::standards::access::pausable
     use miden::core::crypto::dsa::ecdsa_k256_keccak
@@ -150,14 +152,240 @@ const USDCX_MINT_POLICY_MASM: &str = "
 
     #! Mint tokens after verifying an attestation (called from a tx script).
     #!
-    #! Inputs:  [recipient_id, relayer_id, fee_amount]
+    #! Verifies the Falcon512 attestation, then mints (amount - fee_amount) to the
+    #! recipient and fee_amount to the relayer (if fee > 0), producing up to two
+    #! output notes.
+    #!
+    #! Inputs:  [recipient_suffix, recipient_prefix, relayer_suffix, relayer_prefix,
+    #!           fee_amount, amount, tag, note_type, NONCE, PK_COMM]
     #! Outputs: []
     #!
+    #! Panics if:
+    #! - the attester PK_COMM is not in the approved attesters registry.
+    #! - the deposit nonce has already been used.
+    #! - the Falcon512 signature verification fails.
+    #!
     #! Invocation: exec
+    #!
+    #! Local memory layout (16 felts):
+    #!   0: recipient_suffix
+    #!   1: recipient_prefix
+    #!   2: relayer_suffix
+    #!   3: relayer_prefix
+    #!   4: fee_amount
+    #!   5: amount (total)
+    #!   6: tag
+    #!   7: note_type
+    #!   8-11: NONCE (word)
+    #!   12-15: PK_COMM (word)
+    @locals(16)
     pub proc mint_with_attestation
-        # TODO: Full attestation verification (ECDSA + nonce + domain checks),
-        # then invoke mint with fee split between recipient and relayer.
-        push.0 drop
+        # Stack: [recipient_suffix, recipient_prefix, relayer_suffix, relayer_prefix,
+        #         fee_amount, amount, tag, note_type, NONCE(4), PK_COMM(4)]
+
+        # ---- Save all inputs to locals ----
+
+        # Save recipient_suffix and recipient_prefix
+        loc_store.0
+        # => [recipient_prefix, relayer_suffix, relayer_prefix, fee_amount, amount,
+        #     tag, note_type, NONCE(4), PK_COMM(4)]
+        loc_store.1
+        # => [relayer_suffix, relayer_prefix, fee_amount, amount,
+        #     tag, note_type, NONCE(4), PK_COMM(4)]
+
+        # Save relayer_suffix and relayer_prefix
+        loc_store.2
+        # => [relayer_prefix, fee_amount, amount, tag, note_type, NONCE(4), PK_COMM(4)]
+        loc_store.3
+        # => [fee_amount, amount, tag, note_type, NONCE(4), PK_COMM(4)]
+
+        # Save fee_amount, amount, tag, note_type
+        loc_store.4
+        # => [amount, tag, note_type, NONCE(4), PK_COMM(4)]
+        loc_store.5
+        # => [tag, note_type, NONCE(4), PK_COMM(4)]
+        loc_store.6
+        # => [note_type, NONCE(4), PK_COMM(4)]
+        loc_store.7
+        # => [NONCE(4), PK_COMM(4)]
+
+        # Save NONCE word to locals 8-11
+        loc_storew_le.8 dropw
+        # => [PK_COMM(4)]
+
+        # Save PK_COMM word to locals 12-15
+        loc_storew_le.12 dropw
+        # => []
+
+        # ===========================================================================
+        # ATTESTATION VERIFICATION (mirrors check_policy steps 3-8)
+        # ===========================================================================
+
+        # 1. Verify the attester PK_COMM is in the approved registry
+        padw loc_loadw_le.12
+        # => [PK_COMM(4)]
+        dupw
+        push.ATTESTERS_SLOT[0..2]
+        exec.active_account::get_map_item
+        # => [VALUE(4), PK_COMM(4)]
+        # Stored [1,0,0,0] appears reversed as [0,0,0,1]; check VALUE[3]
+        movdn.3 drop drop drop
+        # => [is_approved, PK_COMM(4)]
+        assert.err=ERR_ATTESTER_NOT_APPROVED
+        # => [PK_COMM(4)]
+        dropw
+        # => []
+
+        # 2. Check nonce has not been used
+        padw loc_loadw_le.8
+        # => [NONCE(4)]
+        dupw
+        push.NONCES_SLOT[0..2]
+        exec.active_account::get_map_item
+        # => [NONCE_VAL(4), NONCE(4)]
+        movdn.3 drop drop drop
+        # => [nonce_val_last, NONCE(4)]
+        assertz.err=ERR_NONCE_ALREADY_USED
+        # => [NONCE(4)]
+
+        # 3. Mark nonce as used in storage
+        dupw
+        push.NONCE_USED swapw
+        push.NONCES_SLOT[0..2]
+        exec.native_account::set_map_item
+        dropw
+        # => [NONCE(4)]
+
+        # 4. Compute MESSAGE = merge(NONCE, [amount, domain_id, 0, 0])
+        push.DOMAIN_CONFIG_SLOT[0..2]
+        exec.active_account::get_item
+        # => [CONFIG_WORD(4), NONCE(4)]
+        # CONFIG_WORD reversed on stack: stored [domain_id, min_burn, 0, 0]
+        # appears as [0, 0, min_burn, domain_id]
+        movdn.3 drop drop drop
+        # => [domain_id, NONCE(4)]
+
+        # Build AMOUNT_WORD = [amount, domain_id, 0, 0]
+        loc_load.5 swap push.0 push.0
+        movup.3 movup.3 swap
+        # => [amount, domain_id, 0, 0, NONCE(4)]
+
+        swapw
+        exec.poseidon2::merge
+        # => [MESSAGE(4)]
+
+        # 5. Verify Falcon512 signature
+        # Need PK_COMM and MESSAGE on stack for verify
+        padw loc_loadw_le.12
+        # => [PK_COMM(4), MESSAGE(4)]
+
+        dupw.1 dupw.1
+        exec.poseidon2::merge
+        # => [SIG_KEY(4), PK_COMM(4), MESSAGE(4)]
+
+        adv.push_mapval
+        dropw
+        # => [PK_COMM(4), MESSAGE(4)]
+
+        exec.falcon512_poseidon2::verify
+        # => []
+
+        # ===========================================================================
+        # MINT RECIPIENT AMOUNT: (amount - fee_amount)
+        # ===========================================================================
+
+        # Compute recipient_amount = amount - fee_amount
+        loc_load.5 loc_load.4 sub
+        # => [recipient_amount]
+
+        # Create the fungible asset for the recipient
+        exec.faucet::create_fungible_asset
+        # => [ASSET_KEY(4), ASSET_VALUE(4)]
+
+        # Mint the asset into the faucet vault
+        dupw.1 dupw.1
+        # => [ASSET_KEY(4), ASSET_VALUE(4), ASSET_KEY(4), ASSET_VALUE(4)]
+        exec.faucet::mint
+        # => [ASSET_VALUE(4), ASSET_KEY(4), ASSET_VALUE(4)]
+        dropw
+        # => [ASSET_KEY(4), ASSET_VALUE(4)]
+
+        # Create recipient output note: need [tag, note_type, RECIPIENT(4)]
+        # RECIPIENT is a word built from (recipient_suffix, recipient_prefix)
+        # For a standard recipient, the RECIPIENT word is passed as a 4-felt word.
+        # Here we only have suffix+prefix (account ID), so we build a minimal
+        # RECIPIENT = [recipient_suffix, recipient_prefix, 0, 0]
+        loc_load.6 loc_load.7
+        # => [note_type, tag, ASSET_KEY(4), ASSET_VALUE(4)]
+        loc_load.0 loc_load.1 push.0 push.0
+        # => [0, 0, recipient_prefix, recipient_suffix, note_type, tag,
+        #     ASSET_KEY(4), ASSET_VALUE(4)]
+
+        # Arrange for output_note::create: [tag, note_type, RECIPIENT(4)]
+        movup.5 movup.5
+        # => [tag, note_type, 0, 0, recipient_prefix, recipient_suffix,
+        #     ASSET_KEY(4), ASSET_VALUE(4)]
+
+        exec.output_note::create
+        # => [note_idx, ASSET_KEY(4), ASSET_VALUE(4)]
+
+        # Add the minted asset to the recipient note
+        movdn.8
+        # => [ASSET_KEY(4), ASSET_VALUE(4), note_idx]
+        exec.output_note::add_asset
+        # => []
+
+        # ===========================================================================
+        # MINT FEE AMOUNT TO RELAYER (conditional: only if fee_amount > 0)
+        # ===========================================================================
+
+        loc_load.4
+        # => [fee_amount]
+
+        dup push.0 gt
+        # => [has_fee, fee_amount]
+
+        if.true
+            # fee_amount is on the stack
+            # => [fee_amount]
+
+            # Create the fungible asset for the relayer fee
+            exec.faucet::create_fungible_asset
+            # => [ASSET_KEY(4), ASSET_VALUE(4)]
+
+            # Mint the fee asset into the faucet vault
+            dupw.1 dupw.1
+            # => [ASSET_KEY(4), ASSET_VALUE(4), ASSET_KEY(4), ASSET_VALUE(4)]
+            exec.faucet::mint
+            # => [ASSET_VALUE(4), ASSET_KEY(4), ASSET_VALUE(4)]
+            dropw
+            # => [ASSET_KEY(4), ASSET_VALUE(4)]
+
+            # Create relayer output note
+            # RECIPIENT for relayer = [relayer_suffix, relayer_prefix, 0, 0]
+            loc_load.6 loc_load.7
+            # => [note_type, tag, ASSET_KEY(4), ASSET_VALUE(4)]
+            loc_load.2 loc_load.3 push.0 push.0
+            # => [0, 0, relayer_prefix, relayer_suffix, note_type, tag,
+            #     ASSET_KEY(4), ASSET_VALUE(4)]
+
+            movup.5 movup.5
+            # => [tag, note_type, 0, 0, relayer_prefix, relayer_suffix,
+            #     ASSET_KEY(4), ASSET_VALUE(4)]
+
+            exec.output_note::create
+            # => [note_idx, ASSET_KEY(4), ASSET_VALUE(4)]
+
+            # Add the fee asset to the relayer note
+            movdn.8
+            # => [ASSET_KEY(4), ASSET_VALUE(4), note_idx]
+            exec.output_note::add_asset
+            # => []
+        else
+            # No fee - just drop fee_amount
+            drop
+            # => []
+        end
     end
 
     #! Add an attester to the approved attesters storage map.
