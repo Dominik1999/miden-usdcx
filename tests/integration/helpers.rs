@@ -58,10 +58,10 @@ pub fn mock_attester_pk_comm(index: u8) -> Word {
 // ATTESTATION HELPERS
 // ================================================================================================
 
-/// Generates a deterministic Falcon512 attester key pair from a seed.
+/// Generates a deterministic ECDSA secp256k1 attester key pair from a seed.
 pub fn make_attester_keypair(seed: u64) -> AuthSecretKey {
     let mut rng = ChaCha20Rng::seed_from_u64(seed);
-    AuthSecretKey::new_falcon512_poseidon2_with_rng(&mut rng)
+    AuthSecretKey::new_ecdsa_k256_keccak_with_rng(&mut rng)
 }
 
 /// Extracts the public key commitment (Word) from an attester secret key.
@@ -95,7 +95,7 @@ pub const ATTESTATION_DATA_KEY: Word = Word::new([
 ///
 /// The advice map carries:
 /// - `ATTESTATION_DATA_KEY` -> [PK_COMM(4), NONCE(4)]
-/// - `merge(PK_COMM, MESSAGE)` -> prepared Falcon512 signature
+/// - `merge(PK_COMM, MESSAGE)` -> prepared ECDSA secp256k1 signature
 pub fn attestation_advice(
     attester_sk: &AuthSecretKey,
     nonce: Word,

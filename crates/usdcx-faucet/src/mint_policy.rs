@@ -23,7 +23,7 @@ const USDCX_MINT_POLICY_MASM: &str = "
     use miden::protocol::native_account
     use miden::standards::access::ownable2step
     use miden::standards::access::pausable
-    use miden::core::crypto::dsa::falcon512_poseidon2
+    use miden::core::crypto::dsa::ecdsa_k256_keccak
     use miden::core::crypto::hashes::poseidon2
 
     # CONSTANTS
@@ -48,7 +48,7 @@ const USDCX_MINT_POLICY_MASM: &str = "
 
     #! Mint policy check invoked via dynexec by the TokenPolicyManager.
     #!
-    #! Verifies a Falcon512 attestation from the advice provider before
+    #! Verifies an ECDSA secp256k1 attestation from the advice provider before
     #! allowing the mint to proceed. The attestation data is read from the
     #! advice stack (PK_COMM, NONCE) and the signature is read from the
     #! advice map keyed by merge(PK_COMM, MESSAGE).
@@ -59,7 +59,7 @@ const USDCX_MINT_POLICY_MASM: &str = "
     #! Panics if:
     #! - the attester PK_COMM is not in the approved attesters registry.
     #! - the deposit nonce has already been used.
-    #! - the Falcon512 signature verification fails.
+    #! - the ECDSA secp256k1 signature verification fails.
     #!
     #! Invocation: dynexec
     pub proc check_policy
@@ -132,7 +132,7 @@ const USDCX_MINT_POLICY_MASM: &str = "
         exec.poseidon2::merge
         # => [MESSAGE(4), PK_COMM(4), amount, tag, note_type, RECIPIENT(4)]
 
-        # 8. Verify Falcon512 signature (following x402 pattern)
+        # 8. Verify ECDSA secp256k1 signature (following x402 pattern)
         swapw
         # => [PK_COMM, MESSAGE, amount, tag, note_type, RECIPIENT]
 
@@ -144,7 +144,7 @@ const USDCX_MINT_POLICY_MASM: &str = "
         dropw
         # => [PK_COMM, MESSAGE, amount, tag, note_type, RECIPIENT]
 
-        exec.falcon512_poseidon2::verify
+        exec.ecdsa_k256_keccak::verify
         # => [amount, tag, note_type, RECIPIENT]
     end
 

@@ -48,12 +48,12 @@ fn create_mint_tx_script_code(
 // TESTS
 // ================================================================================================
 
-/// Verifies that minting succeeds with a valid Falcon512 attestation.
+/// Verifies that minting succeeds with a valid ECDSA secp256k1 attestation.
 ///
 /// The check_policy verifies:
 /// 1. The attester PK_COMM is in the approved registry
 /// 2. The nonce has not been used before
-/// 3. The Falcon512 signature over merge(NONCE, [amount, domain_id, 0, 0]) is valid
+/// 3. The ECDSA secp256k1 signature over merge(NONCE, [amount, domain_id, 0, 0]) is valid
 #[tokio::test]
 async fn mint_with_valid_attestation_succeeds() -> anyhow::Result<()> {
     // Generate a real attester key pair
