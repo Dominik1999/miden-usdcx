@@ -54,15 +54,20 @@ const USDCX_BURN_POLICY_MASM: &str = "
         exec.active_account::get_item
         # => [domain_id, min_burn_size, 0, 0, amount]
 
-        # Extract min_burn_size
-        swap drop
+        # Extract min_burn_size: drop domain_id from top
+        drop
         # => [min_burn_size, 0, 0, amount]
 
+        # Keep min_burn_size, drop the two zeros
         movdn.2 drop drop
         # => [min_burn_size, amount]
 
-        # Assert amount >= min_burn_size (i.e. min_burn_size <= amount)
-        u32assert2 u32lte
+        # Assert amount >= min_burn_size (i.e. min_burn_size <= amount).
+        # u32lte checks: second <= top. With [min_burn_size, amount] it checks
+        # amount <= min_burn_size, which is the WRONG direction.
+        # Swap to get [amount, min_burn_size], then u32lte checks
+        # min_burn_size <= amount, which is what we want.
+        swap u32assert2 u32lte
         # => [min_burn_size <= amount]
 
         assert.err=ERR_BELOW_MIN_BURN_SIZE

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use miden_protocol::transaction::RawOutputNote;
-use miden_protocol::{ZERO, Word};
+use miden_protocol::{Felt, ZERO, Word};
 use miden_testing::MockChain;
 use usdcx_faucet::attester_registry::ATTESTER_ACTIVE;
 
@@ -158,8 +158,119 @@ async fn ownership_transfer_two_step() -> anyhow::Result<()> {
     todo!("Implement two-step ownership transfer test")
 }
 
+/// Verifies the full pause/unpause cycle:
+/// 1. Pause the faucet - mint should fail
+/// 2. Unpause the faucet - mint should succeed again
 #[tokio::test]
-#[ignore = "requires PausableManager integration with pause/unpause notes"]
 async fn pause_unpause_cycle() -> anyhow::Result<()> {
-    todo!("Implement pause/unpause cycle test")
+    use miden_protocol::assembly::DefaultSourceManager;
+    use miden_protocol::note::NoteType;
+    use miden_standards::code_builder::CodeBuilder;
+
+    let attester_sk = make_attester_keypair(42);
+    let pk_comm = attester_pk_comm(&attester_sk);
+
+    let owner_id = test_owner_id();
+    let faucet = create_test_usdcx_faucet_existing_with_attesters(owner_id, vec![pk_comm])?;
+
+    // Pre-create all notes before building the chain
+    let source_manager = test_source_manager();
+    let mut rng = test_rng(900);
+    let pause_note = create_pause_note(owner_id, &mut rng, Arc::clone(&source_manager))?;
+
+    let mut rng2 = test_rng(901);
+    let unpause_note = create_unpause_note(owner_id, &mut rng2, Arc::clone(&source_manager))?;
+
+    let mut builder = MockChain::builder();
+    builder.add_account(faucet.clone())?;
+    builder.add_output_note(RawOutputNote::Full(pause_note.clone()));
+    builder.add_output_note(RawOutputNote::Full(unpause_note.clone()));
+    let mut mock_chain = builder.build()?;
+    mock_chain.prove_next_block()?;
+
+    // Helper to attempt a mint transaction (returns true if successful)
+    async fn try_mint(
+        mock_chain: &MockChain,
+        faucet: &miden_protocol::account::Account,
+        attester_sk: &miden_protocol::account::auth::AuthSecretKey,
+        nonce_seed: u64,
+    ) -> anyhow::Result<bool> {
+        let amount: u64 = 100_000;
+        let recipient = Word::from([10u32, 20, 30, 40]);
+        let nonce = Word::new([
+            Felt::new_unchecked(nonce_seed),
+            Felt::new_unchecked(nonce_seed + 1),
+            Felt::new_unchecked(nonce_seed + 2),
+            Felt::new_unchecked(nonce_seed + 3),
+        ]);
+
+        let advice = attestation_advice(attester_sk, nonce, amount, TEST_DOMAIN_ID);
+        let source_manager = Arc::new(DefaultSourceManager::default());
+        let tx_script_code = format!(
+            r#"
+            begin
+                push.{recipient}
+                push.{note_type}
+                push.{tag}
+                push.{amount}
+                push.{faucet_id_prefix}
+                push.{faucet_id_suffix}
+                push.1
+                exec.::miden::protocol::asset::create_fungible_asset
+                call.::miden::standards::faucets::fungible::mint_and_send
+                dropw dropw dropw dropw
+            end
+            "#,
+            recipient = recipient,
+            note_type = NoteType::Private as u8,
+            tag = 0,
+            amount = amount,
+            faucet_id_prefix = faucet.id().prefix().as_felt(),
+            faucet_id_suffix = faucet.id().suffix(),
+        );
+        let tx_script = CodeBuilder::with_source_manager(source_manager.clone())
+            .compile_tx_script(tx_script_code)?;
+
+        let tx_context = mock_chain
+            .build_tx_context(faucet.id(), &[], &[])?
+            .tx_script(tx_script)
+            .with_source_manager(source_manager)
+            .extend_advice_inputs(advice)
+            .build()?;
+
+        match tx_context.execute().await {
+            Ok(_) => Ok(true),
+            Err(_) => Ok(false),
+        }
+    }
+
+    // Step 1: Pause the faucet
+    let sm1 = test_source_manager();
+    let pause_tx = mock_chain
+        .build_tx_context(faucet.id(), &[pause_note.id()], &[])?
+        .with_source_manager(sm1)
+        .build()?;
+    let pause_executed = pause_tx.execute().await?;
+    mock_chain.add_pending_executed_transaction(&pause_executed)?;
+    mock_chain.prove_next_block()?;
+
+    // Step 2: Verify mint fails while paused
+    let mint_result = try_mint(&mock_chain, &faucet, &attester_sk, 100).await?;
+    assert!(!mint_result, "mint should fail while faucet is paused");
+
+    // Step 3: Unpause the faucet
+    let sm2 = test_source_manager();
+    let unpause_tx = mock_chain
+        .build_tx_context(faucet.id(), &[unpause_note.id()], &[])?
+        .with_source_manager(sm2)
+        .build()?;
+    let unpause_executed = unpause_tx.execute().await?;
+    mock_chain.add_pending_executed_transaction(&unpause_executed)?;
+    mock_chain.prove_next_block()?;
+
+    // Step 4: Verify mint succeeds after unpause
+    let mint_result = try_mint(&mock_chain, &faucet, &attester_sk, 200).await?;
+    assert!(mint_result, "mint should succeed after faucet is unpaused");
+
+    Ok(())
 }

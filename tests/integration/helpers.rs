@@ -428,3 +428,30 @@ pub fn create_pause_note(
 
     Ok(note)
 }
+
+/// Creates a note that calls `unpause` on the faucet.
+///
+/// The note sender must be the faucet owner for the call to succeed.
+pub fn create_unpause_note(
+    sender: AccountId,
+    rng: &mut SmallRng,
+    source_manager: Arc<dyn SourceManagerSync>,
+) -> anyhow::Result<Note> {
+    let script = r#"
+        use miden::standards::components::access::pausable::manager->faucet_account
+        @note_script
+        pub proc main
+            padw padw padw padw
+            call.faucet_account::unpause
+            dropw dropw dropw dropw
+        end
+    "#;
+
+    let note = NoteBuilder::new(sender, &mut *rng)
+        .source_manager(source_manager)
+        .dynamically_linked_libraries([pausable_manager_library()])
+        .code(script)
+        .build()?;
+
+    Ok(note)
+}
