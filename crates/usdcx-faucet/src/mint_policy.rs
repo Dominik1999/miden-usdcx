@@ -287,7 +287,7 @@ const USDCX_MINT_POLICY_MASM: &str = "
         dropw
         # => [PK_COMM(4), MESSAGE(4)]
 
-        exec.falcon512_poseidon2::verify
+        exec.ecdsa_k256_keccak::verify
         # => []
 
         # ===========================================================================
