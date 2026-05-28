@@ -368,7 +368,7 @@ cargo test -p usdcx-faucet --test integration   # Run integration tests
 
 ## Design Spec
 
-The full design specification with architectural decisions and requirement analysis is at [`docs/superpowers/specs/2026-05-27-usdcx-faucet-design.md`](docs/superpowers/specs/2026-05-27-usdcx-faucet-design.md).
+Built to [Circle's USDC-backed Stablecoin Specification](https://developers.circle.com/xreserve/concepts/usdc-backed-stablecoin-specification). See the [Requirements Traceability](#requirements-traceability) section above for a full mapping of every Circle requirement to its implementation in this repo.
 
 ## License
 
