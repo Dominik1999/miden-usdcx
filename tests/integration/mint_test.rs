@@ -256,16 +256,79 @@ async fn mint_nonce_replay_fails() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Verifies that minting with a wrong domain ID fails.
+///
+/// The domain_id is part of the signed message: `merge(NONCE, [amount, domain_id, 0, 0])`.
+/// When the domain_id differs between signature and faucet config, the ECDSA signature
+/// verification fails (the message doesn't match). This manifests as an assertion failure
+/// rather than a distinct "wrong domain" error.
 #[tokio::test]
-#[ignore = "domain mismatch causes signature verification failure, not a distinct error"]
 async fn mint_wrong_domain_fails() -> anyhow::Result<()> {
-    todo!("Implement if distinct domain-mismatch error is added to check_policy")
+    let attester_sk = make_attester_keypair(42);
+    let pk_comm = attester_pk_comm(&attester_sk);
+
+    let owner_id = test_owner_id();
+    let faucet = create_test_usdcx_faucet_existing_with_attesters(owner_id, vec![pk_comm])?;
+
+    let mut builder = MockChain::builder();
+    builder.add_account(faucet.clone())?;
+    let mock_chain = builder.build()?;
+
+    let amount: u64 = 100_000;
+    let recipient = Word::from([10u32, 20, 30, 40]);
+    let nonce = Word::new([
+        Felt::new_unchecked(1),
+        Felt::new_unchecked(2),
+        Felt::new_unchecked(3),
+        Felt::new_unchecked(4),
+    ]);
+
+    // Sign with a WRONG domain_id (12345 instead of TEST_DOMAIN_ID=99999)
+    let wrong_domain: u32 = 12345;
+    let advice = attestation_advice(&attester_sk, nonce, amount, wrong_domain);
+
+    let source_manager = Arc::new(DefaultSourceManager::default());
+    let tx_script_code = create_mint_tx_script_code(
+        faucet.id().prefix().as_felt(),
+        faucet.id().suffix(),
+        amount,
+        0,
+        NoteType::Private,
+        recipient,
+    );
+    let tx_script = CodeBuilder::with_source_manager(source_manager.clone())
+        .compile_tx_script(tx_script_code)?;
+
+    let tx_context = mock_chain
+        .build_tx_context(faucet.id(), &[], &[])?
+        .tx_script(tx_script)
+        .with_source_manager(source_manager)
+        .extend_advice_inputs(advice)
+        .build()?;
+
+    let result = tx_context.execute().await;
+    assert!(
+        result.is_err(),
+        "expected transaction to fail when domain_id in signature doesn't match faucet config"
+    );
+
+    Ok(())
 }
 
+/// Fee splitting is not implemented in the current UsdcxMintPolicy check_policy.
+///
+/// The attestation message format is `merge(NONCE, [amount, domain_id, 0, 0])` with no
+/// separate max_fee field. Fee enforcement would require extending the message format
+/// and adding fee-splitting logic to check_policy. This test documents that the feature
+/// is not yet available.
 #[tokio::test]
-#[ignore = "fee splitting not yet implemented in mint_with_attestation"]
+#[ignore = "fee splitting not implemented: message format has no max_fee field, check_policy has no fee logic"]
 async fn mint_fee_exceeds_max_fee_fails() -> anyhow::Result<()> {
-    todo!("Implement once fee splitting is added to check_policy")
+    // This test is intentionally left as ignored with an explanatory message.
+    // When fee splitting is added to check_policy, implement:
+    // 1. Extend the attestation message to include max_fee
+    // 2. Test that fee_amount > max_fee causes check_policy to reject
+    Ok(())
 }
 
 #[tokio::test]

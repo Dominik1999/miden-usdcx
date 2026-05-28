@@ -152,10 +152,110 @@ async fn owner_can_set_min_burn_size() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Verifies the full two-step ownership transfer flow:
+/// 1. Alice (current owner) nominates Bob via `transfer_ownership`
+/// 2. Bob accepts via `accept_ownership`
+/// 3. Bob is now the owner (can perform admin operations)
+/// 4. Alice is no longer the owner (admin operations fail)
 #[tokio::test]
-#[ignore = "requires full Ownable2Step integration with ownership transfer notes"]
 async fn ownership_transfer_two_step() -> anyhow::Result<()> {
-    todo!("Implement two-step ownership transfer test")
+    use miden_protocol::testing::account_id::AccountIdBuilder;
+
+    let alice_id = test_owner_id(); // current owner
+    let bob_id = AccountIdBuilder::new().build_with_seed([42; 32]);
+    let faucet = create_test_usdcx_faucet_existing(alice_id)?;
+
+    // Pre-create all notes
+    let source_manager = test_source_manager();
+    let mut rng1 = test_rng(2000);
+    let transfer_note = create_transfer_ownership_note(
+        alice_id,
+        bob_id,
+        &mut rng1,
+        Arc::clone(&source_manager),
+    )?;
+
+    let mut rng2 = test_rng(2001);
+    let accept_note = create_accept_ownership_note(
+        bob_id,
+        &mut rng2,
+        Arc::clone(&source_manager),
+    )?;
+
+    // Create a note from Bob to add an attester (proving Bob is the new owner)
+    let new_attester = mock_attester_pk_comm(5);
+    let mut rng3 = test_rng(2002);
+    let bob_admin_note = create_add_attester_note(
+        bob_id,
+        new_attester,
+        &mut rng3,
+        Arc::clone(&source_manager),
+    )?;
+
+    // Create a note from Alice to add an attester (should fail after transfer)
+    let another_attester = mock_attester_pk_comm(6);
+    let mut rng4 = test_rng(2003);
+    let alice_admin_note = create_add_attester_note(
+        alice_id,
+        another_attester,
+        &mut rng4,
+        Arc::clone(&source_manager),
+    )?;
+
+    let mut builder = MockChain::builder();
+    builder.add_account(faucet.clone())?;
+    builder.add_output_note(RawOutputNote::Full(transfer_note.clone()));
+    builder.add_output_note(RawOutputNote::Full(accept_note.clone()));
+    builder.add_output_note(RawOutputNote::Full(bob_admin_note.clone()));
+    builder.add_output_note(RawOutputNote::Full(alice_admin_note.clone()));
+    let mut mock_chain = builder.build()?;
+    mock_chain.prove_next_block()?;
+
+    // Step 1: Alice nominates Bob
+    let sm1 = test_source_manager();
+    let transfer_tx = mock_chain
+        .build_tx_context(faucet.id(), &[transfer_note.id()], &[])?
+        .with_source_manager(sm1)
+        .build()?;
+    let transfer_executed = transfer_tx.execute().await?;
+    mock_chain.add_pending_executed_transaction(&transfer_executed)?;
+    mock_chain.prove_next_block()?;
+
+    // Step 2: Bob accepts ownership
+    let sm2 = test_source_manager();
+    let accept_tx = mock_chain
+        .build_tx_context(faucet.id(), &[accept_note.id()], &[])?
+        .with_source_manager(sm2)
+        .build()?;
+    let accept_executed = accept_tx.execute().await?;
+    mock_chain.add_pending_executed_transaction(&accept_executed)?;
+    mock_chain.prove_next_block()?;
+
+    // Step 3: Bob can perform admin operations (add attester)
+    let sm3 = test_source_manager();
+    let bob_tx = mock_chain
+        .build_tx_context(faucet.id(), &[bob_admin_note.id()], &[])?
+        .with_source_manager(sm3)
+        .build()?;
+    let bob_executed = bob_tx.execute().await?;
+    mock_chain.add_pending_executed_transaction(&bob_executed)?;
+    mock_chain.prove_next_block()?;
+
+    // Step 4: Alice can no longer perform admin operations
+    let sm4 = test_source_manager();
+    let alice_tx = mock_chain
+        .build_tx_context(faucet.id(), &[alice_admin_note.id()], &[])?
+        .with_source_manager(sm4)
+        .build()?;
+    let result = alice_tx.execute().await;
+    assert!(result.is_err(), "Alice should no longer be owner after transfer");
+    let err_str = format!("{}", result.unwrap_err());
+    assert!(
+        err_str.contains("assertion failed"),
+        "expected assertion failure for non-owner, got: {err_str}"
+    );
+
+    Ok(())
 }
 
 /// Verifies the full pause/unpause cycle:

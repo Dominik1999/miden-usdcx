@@ -18,8 +18,8 @@ use miden_standards::account::access::{AccessControl, PausableManager};
 use miden_standards::account::auth::NoAuth;
 use miden_standards::account::faucets::{FungibleFaucet, TokenName};
 use miden_standards::account::policies::{
-    BlocklistOwnerControlled, BurnPolicyConfig, MintPolicyConfig, PolicyRegistration,
-    TokenPolicyManager, TransferPolicy,
+    BlocklistOwnerControlled, BurnPolicyConfig, MintPolicyConfig,
+    PolicyRegistration, TokenPolicyManager, TransferPolicy,
 };
 use miden_standards::testing::note::NoteBuilder;
 use miden_testing::MockChain;
@@ -400,6 +400,208 @@ pub fn create_test_usdcx_faucet_existing_with_attesters(
 /// Returns the compiled MASM library for the PausableManager component.
 pub fn pausable_manager_library() -> Library {
     PausableManager::code().as_library().clone()
+}
+
+/// Returns the compiled MASM library for the BlocklistOwnerControlled component.
+pub fn blocklist_owner_controlled_library() -> Library {
+    BlocklistOwnerControlled::code().as_library().clone()
+}
+
+/// Returns the compiled MASM library for the Ownable2Step component.
+pub fn ownable2step_library() -> Library {
+    use miden_standards::account::access::Ownable2Step;
+    Ownable2Step::code().as_library().clone()
+}
+
+/// Creates a USDCx faucet with initial blocked accounts in the blocklist.
+///
+/// This replaces the default empty `BasicBlocklist` with one seeded with blocked accounts.
+#[allow(dead_code)]
+pub fn create_test_usdcx_faucet_existing_with_blocklist(
+    owner_id: AccountId,
+    attesters: Vec<Word>,
+    blocked_accounts: Vec<AccountId>,
+) -> anyhow::Result<Account> {
+    use miden_standards::account::policies::BasicBlocklist;
+
+    let token_name = TokenName::new("USDCx")?;
+    let token_symbol = miden_protocol::asset::TokenSymbol::new("USDCX")?;
+
+    let faucet = FungibleFaucet::builder()
+        .name(token_name)
+        .symbol(token_symbol)
+        .decimals(6)
+        .max_supply(AssetAmount::try_from(TEST_MAX_SUPPLY)?)
+        .build()?;
+
+    let attester_registry = AttesterRegistry::new(attesters)
+        .expect("at least one attester is required");
+    let nonce_registry = NonceRegistry::new();
+    let domain_config = DomainConfig::new(TEST_DOMAIN_ID, TEST_MIN_BURN_SIZE);
+    let mint_policy = UsdcxMintPolicy::new(attester_registry, nonce_registry, domain_config);
+    let burn_policy = UsdcxBurnPolicy::new();
+
+    // Use Custom transfer policy + explicit BasicBlocklist with initial blocked accounts.
+    // This avoids the default empty BasicBlocklist that TransferPolicy::Blocklist creates.
+    let blocklist_root = BasicBlocklist::root();
+    let token_policy_manager = TokenPolicyManager::new()
+        .with_mint_policy(
+            MintPolicyConfig::Custom(UsdcxMintPolicy::check_policy_root().as_word()),
+            PolicyRegistration::Active,
+        )?
+        .with_burn_policy(
+            BurnPolicyConfig::Custom(UsdcxBurnPolicy::check_policy_root().as_word()),
+            PolicyRegistration::Active,
+        )?
+        .with_send_policy(TransferPolicy::Custom(blocklist_root), PolicyRegistration::Active)?
+        .with_receive_policy(TransferPolicy::Custom(blocklist_root), PolicyRegistration::Active)?;
+
+    let access_control = AccessControl::Ownable2Step { owner: owner_id };
+    let blocklist = BasicBlocklist::with_blocked_accounts(blocked_accounts);
+
+    let account = AccountBuilder::new([0u8; 32])
+        .account_type(AccountType::Public)
+        .with_auth_component(NoAuth::new())
+        .with_component(faucet)
+        .with_components(access_control)
+        .with_components(token_policy_manager)
+        .with_component(PausableManager)
+        .with_component(mint_policy)
+        .with_component(burn_policy)
+        .with_component(blocklist)
+        .with_component(BlocklistOwnerControlled)
+        .build_existing()?;
+
+    Ok(account)
+}
+
+/// Creates a note that calls `block_account` on the faucet via BlocklistOwnerControlled.
+///
+/// The note sender must be the faucet owner for the call to succeed.
+pub fn create_block_account_note(
+    sender: AccountId,
+    target_account: AccountId,
+    rng: &mut SmallRng,
+    source_manager: Arc<dyn SourceManagerSync>,
+) -> anyhow::Result<Note> {
+    let script = format!(
+        r#"
+        use miden::standards::components::faucets::policies::transfer::blocklist::owner_controlled->faucet_account
+        @note_script
+        pub proc main
+            repeat.14 push.0 end
+            push.{target_prefix}
+            push.{target_suffix}
+            call.faucet_account::block_account
+            dropw dropw dropw dropw
+        end
+    "#,
+        target_suffix = target_account.suffix(),
+        target_prefix = target_account.prefix().as_felt(),
+    );
+
+    let note = NoteBuilder::new(sender, &mut *rng)
+        .source_manager(source_manager)
+        .dynamically_linked_libraries([blocklist_owner_controlled_library()])
+        .code(script)
+        .build()?;
+
+    Ok(note)
+}
+
+/// Creates a note that calls `unblock_account` on the faucet via BlocklistOwnerControlled.
+///
+/// The note sender must be the faucet owner for the call to succeed.
+pub fn create_unblock_account_note(
+    sender: AccountId,
+    target_account: AccountId,
+    rng: &mut SmallRng,
+    source_manager: Arc<dyn SourceManagerSync>,
+) -> anyhow::Result<Note> {
+    let script = format!(
+        r#"
+        use miden::standards::components::faucets::policies::transfer::blocklist::owner_controlled->faucet_account
+        @note_script
+        pub proc main
+            repeat.14 push.0 end
+            push.{target_prefix}
+            push.{target_suffix}
+            call.faucet_account::unblock_account
+            dropw dropw dropw dropw
+        end
+    "#,
+        target_suffix = target_account.suffix(),
+        target_prefix = target_account.prefix().as_felt(),
+    );
+
+    let note = NoteBuilder::new(sender, &mut *rng)
+        .source_manager(source_manager)
+        .dynamically_linked_libraries([blocklist_owner_controlled_library()])
+        .code(script)
+        .build()?;
+
+    Ok(note)
+}
+
+/// Creates a note that calls `transfer_ownership` on the faucet via Ownable2Step.
+///
+/// The note sender must be the current owner for the call to succeed.
+pub fn create_transfer_ownership_note(
+    sender: AccountId,
+    new_owner: AccountId,
+    rng: &mut SmallRng,
+    source_manager: Arc<dyn SourceManagerSync>,
+) -> anyhow::Result<Note> {
+    let script = format!(
+        r#"
+        use miden::standards::access::ownable2step->faucet_account
+        @note_script
+        pub proc main
+            repeat.14 push.0 end
+            push.{new_owner_prefix}
+            push.{new_owner_suffix}
+            call.faucet_account::transfer_ownership
+            dropw dropw dropw dropw
+        end
+    "#,
+        new_owner_suffix = new_owner.suffix(),
+        new_owner_prefix = new_owner.prefix().as_felt(),
+    );
+
+    let note = NoteBuilder::new(sender, &mut *rng)
+        .source_manager(source_manager)
+        .dynamically_linked_libraries([ownable2step_library()])
+        .code(script)
+        .build()?;
+
+    Ok(note)
+}
+
+/// Creates a note that calls `accept_ownership` on the faucet via Ownable2Step.
+///
+/// The note sender must be the nominated owner for the call to succeed.
+pub fn create_accept_ownership_note(
+    sender: AccountId,
+    rng: &mut SmallRng,
+    source_manager: Arc<dyn SourceManagerSync>,
+) -> anyhow::Result<Note> {
+    let script = r#"
+        use miden::standards::access::ownable2step->faucet_account
+        @note_script
+        pub proc main
+            padw padw padw padw
+            call.faucet_account::accept_ownership
+            dropw dropw dropw dropw
+        end
+    "#;
+
+    let note = NoteBuilder::new(sender, &mut *rng)
+        .source_manager(source_manager)
+        .dynamically_linked_libraries([ownable2step_library()])
+        .code(script)
+        .build()?;
+
+    Ok(note)
 }
 
 /// Creates a note that calls `pause` on the faucet.
