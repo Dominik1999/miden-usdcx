@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tracing::{debug, info};
 
 /// Attestation returned by Circle for a cross-chain deposit message.
 #[derive(Debug, Clone, Deserialize)]
@@ -56,10 +57,31 @@ impl CircleApiClient {
         }
     }
 
+    /// Helper to check an HTTP response status and convert errors.
+    async fn check_response(resp: reqwest::Response) -> Result<reqwest::Response, CircleApiError> {
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let message = resp.text().await.unwrap_or_default();
+            return Err(CircleApiError::Api { status, message });
+        }
+        Ok(resp)
+    }
+
     /// Retrieve an attestation for a cross-chain deposit message hash.
     pub async fn get_attestation(&self, hash: &str) -> Result<Attestation, CircleApiError> {
-        let _ = (hash, &self.client, &self.base_url);
-        todo!("fetch attestation from Circle API")
+        let url = format!("{}/v1/attestations/{}", self.base_url, hash);
+        debug!(hash, url, "fetching attestation from Circle API");
+
+        let resp = self.client.get(&url).send().await?;
+        let resp = Self::check_response(resp).await?;
+        let attestation: Attestation = resp.json().await?;
+
+        info!(
+            hash,
+            attestation_len = attestation.attestation.len(),
+            "received attestation"
+        );
+        Ok(attestation)
     }
 
     /// Prepare a batch withdrawal from a list of burn intents.
@@ -67,8 +89,20 @@ impl CircleApiClient {
         &self,
         intents: Vec<BurnIntent>,
     ) -> Result<PreparedWithdrawal, CircleApiError> {
-        let _ = (intents, &self.client, &self.base_url);
-        todo!("prepare withdrawal batch via Circle API")
+        let url = format!("{}/v1/withdrawals/prepare", self.base_url);
+        let intent_count = intents.len();
+        debug!(intent_count, url, "preparing withdrawal batch");
+
+        let resp = self.client.post(&url).json(&intents).send().await?;
+        let resp = Self::check_response(resp).await?;
+        let prepared: PreparedWithdrawal = resp.json().await?;
+
+        info!(
+            intent_count,
+            encoded_count = prepared.burn_intents.len(),
+            "withdrawal batch prepared"
+        );
+        Ok(prepared)
     }
 
     /// Submit a signed withdrawal batch to Circle.
@@ -76,8 +110,16 @@ impl CircleApiClient {
         &self,
         batch: Vec<u8>,
     ) -> Result<WithdrawalResult, CircleApiError> {
-        let _ = (batch, &self.client, &self.base_url);
-        todo!("submit withdrawal batch to Circle API")
+        let url = format!("{}/v1/withdrawals/submit", self.base_url);
+        let batch_size = batch.len();
+        debug!(batch_size, url, "submitting signed withdrawal batch");
+
+        let resp = self.client.post(&url).body(batch).send().await?;
+        let resp = Self::check_response(resp).await?;
+        let result: WithdrawalResult = resp.json().await?;
+
+        info!(withdrawal_id = %result.withdrawal_id, "withdrawal submitted");
+        Ok(result)
     }
 
     /// Poll the status of a previously submitted withdrawal.
@@ -85,8 +127,15 @@ impl CircleApiClient {
         &self,
         id: &str,
     ) -> Result<WithdrawalStatus, CircleApiError> {
-        let _ = (id, &self.client, &self.base_url);
-        todo!("get withdrawal status from Circle API")
+        let url = format!("{}/v1/withdrawals/{}/status", self.base_url, id);
+        debug!(id, url, "polling withdrawal status");
+
+        let resp = self.client.get(&url).send().await?;
+        let resp = Self::check_response(resp).await?;
+        let status: WithdrawalStatus = resp.json().await?;
+
+        info!(id, status = %status.status, "withdrawal status retrieved");
+        Ok(status)
     }
 }
 
