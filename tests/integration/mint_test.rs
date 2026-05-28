@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
+use miden_protocol::account::AccountId;
 use miden_protocol::assembly::DefaultSourceManager;
-use miden_protocol::note::NoteType;
+use miden_protocol::note::{NoteTag, NoteType};
 use miden_protocol::transaction::RawOutputNote;
 use miden_protocol::{Felt, Word};
 use miden_standards::code_builder::CodeBuilder;
@@ -13,6 +14,10 @@ use crate::helpers::*;
 // ================================================================================================
 
 /// Creates a tx script that mints fungible tokens via mint_and_send.
+///
+/// The minted tokens are sent as a standard P2ID note to the recipient.
+/// The `tag` should be `NoteTag::with_account_target(recipient_account_id)`
+/// so the recipient's Miden client can discover the note during sync.
 fn create_mint_tx_script_code(
     faucet_id_prefix: Felt,
     faucet_id_suffix: Felt,
@@ -45,10 +50,22 @@ fn create_mint_tx_script_code(
     )
 }
 
+/// Computes the note tag for a mint output note targeting a specific recipient.
+///
+/// Uses `NoteTag::with_account_target` so the recipient's client can discover
+/// the note during sync. This is the standard P2ID note tag scheme.
+fn mint_note_tag(recipient_id: AccountId) -> u32 {
+    NoteTag::with_account_target(recipient_id).as_u32()
+}
+
 // TESTS
 // ================================================================================================
 
 /// Verifies that minting succeeds with a valid ECDSA secp256k1 attestation.
+///
+/// The minted tokens are sent as a standard P2ID note to the recipient, tagged
+/// with `NoteTag::with_account_target(recipient_id)` so the recipient's client
+/// can discover the note during sync.
 ///
 /// The check_policy verifies:
 /// 1. The attester PK_COMM is in the approved registry
@@ -66,11 +83,16 @@ async fn mint_with_valid_attestation_succeeds() -> anyhow::Result<()> {
 
     let mut builder = MockChain::builder();
     builder.add_account(faucet.clone())?;
+
+    // Create a real recipient wallet so we can compute the correct note tag
+    let recipient_wallet = builder.add_existing_wallet(miden_testing::Auth::Noop)?;
+
     let mock_chain = builder.build()?;
 
     let amount: u64 = 100_000;
     let recipient = Word::from([10u32, 20, 30, 40]);
-    let tag: u32 = 0;
+    // Tag the mint note with the recipient's account ID for P2ID discovery
+    let tag: u32 = mint_note_tag(recipient_wallet.id());
     let note_type = NoteType::Private;
     let nonce = Word::new([
         Felt::new_unchecked(1),
@@ -112,7 +134,7 @@ async fn mint_with_valid_attestation_succeeds() -> anyhow::Result<()> {
     assert_eq!(
         executed.output_notes().num_notes(),
         1,
-        "should have created exactly one output note"
+        "should have created exactly one P2ID output note for the recipient"
     );
 
     Ok(())

@@ -47,16 +47,16 @@ Two entries go into the advice map (a key-value store passed alongside the trans
 | `ATTESTATION_DATA_KEY` (well-known constant) | `[pk_comm(4 felts), nonce(4 felts)]` |
 | `merge(pk_comm, message)` | prepared ECDSA signature (~26 felts) |
 
-**Step 3 - Build the transaction script.** The tx script pushes mint parameters onto the stack and calls `mint_and_send`:
+**Step 3 - Build the transaction script.** The tx script pushes mint parameters onto the stack and calls `mint_and_send`. The output is a **standard P2ID note** - the same note type used for all Miden token transfers. The tag is set to `NoteTag::with_account_target(recipient_id)` so Alice's Miden client discovers the note during sync.
 
 ```masm
 begin
-    push.RECIPIENT
-    push.NOTE_TYPE
-    push.TAG
-    push.AMOUNT
-    push.FAUCET_ID
-    push.1
+    push.RECIPIENT                     # P2ID recipient commitment (Alice)
+    push.NOTE_TYPE                     # public or private
+    push.TAG                           # NoteTag::with_account_target(alice_id)
+    push.AMOUNT                        # USDCx amount to mint
+    push.FAUCET_ID                     # USDCx faucet account ID
+    push.1                             # has_callbacks flag
     exec.::miden::protocol::asset::create_fungible_asset
     call.::miden::standards::faucets::fungible::mint_and_send
 end
@@ -91,7 +91,16 @@ Stack on exit: `[amount, tag, note_type, RECIPIENT]` (unchanged - passed back to
 - Calls `faucet::create_fungible_asset` + `faucet::mint`
 - Adds the minted asset to the output note
 
-**Step 8 - Transaction completes.** The result is one output note containing the minted USDCx tokens. The faucet's `token_supply` is incremented. The nonce is marked as used (replay-protected).
+**Step 8 - Transaction completes.** The result is one **standard P2ID output note** containing the minted USDCx tokens, tagged with Alice's account ID. Alice's Miden client discovers the note during sync, and she consumes it to add the tokens to her vault. The faucet's `token_supply` is incremented. The nonce is marked as used (replay-protected).
+
+### Note types
+
+| Note | Type | Tag | Direction | Purpose |
+|---|---|---|---|---|
+| Mint output (P2ID) | Private or Public | `NoteTag::with_account_target(recipient_id)` | Faucet -> Alice | Delivers minted USDCx to recipient |
+| Burn (BurnNote) | Always Public | `NoteTag::with_account_target(faucet_id)` | Alice -> Faucet | Redeems USDCx for USDC withdrawal |
+
+The mint output is a standard P2ID note - it uses the same note type as all Miden token transfers. There is nothing USDCx-specific about the output note; the attestation verification happens entirely within the faucet's mint policy before the note is created. The BurnNote is always public to provide an on-chain audit trail for withdrawals.
 
 ### What gets verified (Circle spec compliance)
 
