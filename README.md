@@ -20,6 +20,165 @@ The faucet is a single Miden account composed from standard miden-standards comp
 - `UsdcxMintPolicy` - attestation-gated minting with ECDSA verification, nonce replay protection, attester registry
 - `UsdcxBurnPolicy` - minimum burn size enforcement
 
+## How Minting Works
+
+Step-by-step walkthrough of the USDCx mint flow, from the relayer preparing the transaction to the Miden VM verifying the attestation on-chain.
+
+### Off-chain: Relayer prepares the transaction
+
+**Step 1 - Generate attestation data.** The relayer has a deposit attestation from Circle's xReserve (an ECDSA secp256k1 signature from an approved attester). It computes:
+
+- `PK_COMM` = Poseidon2 hash of the attester's compressed secp256k1 public key
+- `NONCE` = unique 32-byte deposit nonce (from Circle's deposit intent)
+- `MESSAGE` = `Poseidon2::merge(NONCE, [amount, domain_id, 0, 0])` - a domain-bound commitment to the deposit
+
+**Step 2 - Sign and build the advice map.** The relayer signs the message and encodes it for the Miden VM:
+
+```rust
+let sig = attester_sk.sign(message);                  // ECDSA secp256k1 signature
+let prepared = sig.to_prepared_signature(message);    // encode for Miden VM advice stack
+let sig_key = Hasher::merge(&[pk_comm, message]);     // advice map lookup key
+```
+
+Two entries go into the advice map (a key-value store passed alongside the transaction):
+
+| Key | Value |
+|---|---|
+| `ATTESTATION_DATA_KEY` (well-known constant) | `[pk_comm(4 felts), nonce(4 felts)]` |
+| `merge(pk_comm, message)` | prepared ECDSA signature (~26 felts) |
+
+**Step 3 - Build the transaction script.** The tx script pushes mint parameters onto the stack and calls `mint_and_send`:
+
+```masm
+begin
+    push.RECIPIENT
+    push.NOTE_TYPE
+    push.TAG
+    push.AMOUNT
+    push.FAUCET_ID
+    push.1
+    exec.::miden::protocol::asset::create_fungible_asset
+    call.::miden::standards::faucets::fungible::mint_and_send
+end
+```
+
+**Step 4 - Submit the transaction** against the faucet account with the advice map attached.
+
+### On-chain: Miden VM executes the transaction
+
+**Step 5 - `mint_and_send` runs** (from miden-standards). This standard procedure extracts the amount from the asset, then calls `execute_mint_policy` which checks `assert_not_paused` and `dynexec`s our custom `check_policy`.
+
+**Step 6 - `check_policy` runs via dynexec** (our custom MASM in [`mint_policy.rs`](crates/usdcx-faucet/src/mint_policy.rs)). Stack on entry: `[amount, tag, note_type, RECIPIENT]`.
+
+| Sub-step | What happens | On failure |
+|---|---|---|
+| 6a | Load attestation data from advice map via `ATTESTATION_DATA_KEY`. PK_COMM and NONCE are now on the advice stack. | - |
+| 6b | Read `PK_COMM` from advice stack via `adv_loadw`. | - |
+| 6c | Look up PK_COMM in the `attesters` storage map. Assert value is `[1,0,0,0]` (registered). | PANIC: "attester public key commitment not in registry" |
+| 6d | Read `NONCE` from advice stack via `adv_loadw`. | - |
+| 6e | Look up NONCE in the `used_nonces` storage map. Assert value is `[0,0,0,0]` (unused). | PANIC: "deposit intent nonce has already been used" |
+| 6f | Write `[1,0,0,0]` to `used_nonces` map at NONCE key. Nonce is now consumed. | - |
+| 6g | Read `domain_id` from `domain_config` slot. Compute `MESSAGE = Poseidon2::merge(NONCE, [amount, domain_id, 0, 0])`. | - |
+| 6h | Compute `SIG_KEY = Poseidon2::merge(PK_COMM, MESSAGE)`. Fetch prepared signature from advice map via `adv.push_mapval`. Call `ecdsa_k256_keccak::verify` which consumes `[PK_COMM, MESSAGE]` from the stack and the signature from the advice stack. | PANIC: signature verification failed |
+
+Stack on exit: `[amount, tag, note_type, RECIPIENT]` (unchanged - passed back to `mint_and_send`).
+
+**Step 7 - Back in `mint_and_send`** (miden-standards). After `check_policy` returns:
+
+- Validates `amount <= max_supply - token_supply` (supply cap)
+- Increments `token_supply` by `amount`
+- Creates an output note addressed to RECIPIENT
+- Calls `faucet::create_fungible_asset` + `faucet::mint`
+- Adds the minted asset to the output note
+
+**Step 8 - Transaction completes.** The result is one output note containing the minted USDCx tokens. The faucet's `token_supply` is incremented. The nonce is marked as used (replay-protected).
+
+### What gets verified (Circle spec compliance)
+
+| Check | Where | Circle Requirement |
+|---|---|---|
+| Attester is approved | Step 6c - registry lookup | MINT-PRE-1 |
+| Nonce not replayed | Step 6e - nonce registry | MINT-PRE-10 |
+| Nonce marked used | Step 6f - storage write | MINT-STATE-1 |
+| Domain matches faucet | Step 6g - domain_id baked into signed message | MINT-PRE-5 |
+| Signature valid (ECDSA secp256k1) | Step 6h - `ecdsa_k256_keccak::verify` | MINT-PRE-1 |
+| Faucet not paused | Step 5 - `execute_mint_policy` checks before dynexec | Operational safety |
+| Supply cap respected | Step 7 - `mint_and_send` validates supply | STATE-6 |
+
+## How Burning Works
+
+Step-by-step walkthrough of the USDCx burn flow, from a user redeeming tokens to the faucet decrementing supply.
+
+### Off-chain: User creates a burn note
+
+**Step 1 - User creates a BurnNote.** The user holds USDCx tokens in their account vault. To redeem them for USDC, they create a BurnNote - a public note containing the tokens to destroy, addressed to the faucet.
+
+```rust
+let burn_note = BurnNote::create(sender, faucet_id, fungible_asset, attachments, rng)?;
+// BurnNote is always NoteType::Public (observable on-chain for audit trail)
+// The asset is moved from the user's vault INTO the note
+```
+
+The BurnNote's script calls `receive_and_burn` on the faucet:
+
+```masm
+@note_script
+pub proc main
+    dropw
+    call.::miden::standards::faucets::fungible::receive_and_burn
+end
+```
+
+**Step 2 - Submit the note to the network.** The BurnNote is sent to the Miden network, tagged with the faucet's account ID so it routes to the correct faucet.
+
+### On-chain: Faucet processes the burn
+
+**Step 3 - Faucet consumes the BurnNote.** A transaction is executed against the faucet account with the BurnNote as an input note. The note script runs.
+
+**Step 4 - `receive_and_burn` runs** (from miden-standards). This standard procedure:
+
+- Extracts the asset (ASSET_KEY + ASSET_VALUE) from the note
+- Calls `execute_burn_policy` which checks `assert_not_paused` and `dynexec`s our custom burn `check_policy`
+
+**Step 5 - `check_policy` runs via dynexec** (our custom MASM in [`burn_policy.rs`](crates/usdcx-faucet/src/burn_policy.rs)). Stack on entry: `[ASSET_KEY(4), ASSET_VALUE(4)]`.
+
+| Sub-step | What happens | On failure |
+|---|---|---|
+| 5a | Drop `ASSET_KEY` (4 felts). Extract `amount` from `ASSET_VALUE` (`[amount, 0, 0, 0]` for fungible assets). | - |
+| 5b | Read `domain_config` storage slot. Extract `min_burn_size` (second element). | - |
+| 5c | Assert `amount >= min_burn_size`. | PANIC: "burn amount is below minimum burn size" |
+
+Stack on exit: `[]` (burn policy must consume both words).
+
+**Step 6 - Back in `receive_and_burn`** (miden-standards). After `check_policy` returns:
+
+- Calls `faucet::burn` to destroy the asset
+- Decrements `token_supply` by the burn amount
+- The tokens are permanently removed from circulation
+
+**Step 7 - Transaction completes.** The BurnNote is consumed (nullified). The faucet's `token_supply` is decremented. The burned tokens no longer exist anywhere in the system.
+
+### What gets verified (Circle spec compliance)
+
+| Check | Where | Circle Requirement |
+|---|---|---|
+| Amount > 0 | FungibleAsset construction rejects zero | BURN-PRE-1 |
+| Caller holds sufficient balance | User must have tokens in vault to create the note | BURN-PRE-2 |
+| Amount >= minBurnSize | Step 5c - burn policy check | BURN-PRE-3 |
+| Supply decremented | Step 6 - `receive_and_burn` | BURN-STATE-2 |
+| Faucet not paused | Step 4 - `execute_burn_policy` checks before dynexec | Operational safety |
+
+### Off-chain: Relayer processes the withdrawal
+
+After the burn completes on Miden, the off-chain withdrawal service:
+
+1. Detects the burn event (BurnNote is public, so it's observable)
+2. Calls Circle's `POST /v1/prepare-withdrawal` with the burn details
+3. Collects 2+ signatures on the burn intent batch (multi-sig requirement)
+4. Submits via `POST /v1/withdraw`
+5. Polls `GET /v1/withdrawal/{id}` until status reaches `finalized`
+6. USDC is released to the user's destination on Ethereum (or another supported chain)
+
 ## Requirements Traceability
 
 Every requirement from Circle's [USDC-backed Stablecoin Specification](https://developers.circle.com/xreserve/concepts/usdc-backed-stablecoin-specification) mapped to its implementation.
