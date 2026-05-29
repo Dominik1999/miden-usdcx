@@ -304,7 +304,7 @@ async fn pause_unpause_cycle() -> anyhow::Result<()> {
             Felt::new_unchecked(nonce_seed + 3),
         ]);
 
-        let advice = attestation_advice(attester_sk, nonce, amount, TEST_DOMAIN_ID);
+        let advice = attestation_advice(attester_sk, nonce, amount, TEST_DOMAIN_ID, 0, 0);
         let source_manager = Arc::new(DefaultSourceManager::default());
         let tx_script_code = format!(
             r#"

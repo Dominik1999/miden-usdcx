@@ -102,7 +102,7 @@ async fn mint_with_valid_attestation_succeeds() -> anyhow::Result<()> {
     ]);
 
     // Build advice inputs with the attestation signature
-    let advice = attestation_advice(&attester_sk, nonce, amount, TEST_DOMAIN_ID);
+    let advice = attestation_advice(&attester_sk, nonce, amount, TEST_DOMAIN_ID, 0, 0);
 
     // Verify PK_COMM is in the faucet storage
     debug_assert_eq!(
@@ -167,7 +167,7 @@ async fn mint_with_unknown_attester_fails() -> anyhow::Result<()> {
     ]);
 
     // Sign with the unknown attester (not in registry)
-    let advice = attestation_advice(&unknown_sk, nonce, amount, TEST_DOMAIN_ID);
+    let advice = attestation_advice(&unknown_sk, nonce, amount, TEST_DOMAIN_ID, 0, 0);
 
     let source_manager = Arc::new(DefaultSourceManager::default());
     let tx_script_code = create_mint_tx_script_code(
@@ -222,7 +222,7 @@ async fn mint_nonce_replay_fails() -> anyhow::Result<()> {
     ]);
 
     // First mint should succeed
-    let advice1 = attestation_advice(&attester_sk, nonce, amount, TEST_DOMAIN_ID);
+    let advice1 = attestation_advice(&attester_sk, nonce, amount, TEST_DOMAIN_ID, 0, 0);
     let source_manager = Arc::new(DefaultSourceManager::default());
     let tx_script_code = create_mint_tx_script_code(
         faucet.id().prefix().as_felt(),
@@ -247,7 +247,7 @@ async fn mint_nonce_replay_fails() -> anyhow::Result<()> {
     mock_chain.prove_next_block()?;
 
     // Second mint with the same nonce should fail
-    let advice2 = attestation_advice(&attester_sk, nonce, amount, TEST_DOMAIN_ID);
+    let advice2 = attestation_advice(&attester_sk, nonce, amount, TEST_DOMAIN_ID, 0, 0);
     let source_manager2 = Arc::new(DefaultSourceManager::default());
     let tx_script_code2 = create_mint_tx_script_code(
         faucet.id().prefix().as_felt(),
@@ -307,7 +307,7 @@ async fn mint_wrong_domain_fails() -> anyhow::Result<()> {
 
     // Sign with a WRONG domain_id (12345 instead of TEST_DOMAIN_ID=99999)
     let wrong_domain: u32 = 12345;
-    let advice = attestation_advice(&attester_sk, nonce, amount, wrong_domain);
+    let advice = attestation_advice(&attester_sk, nonce, amount, wrong_domain, 0, 0);
 
     let source_manager = Arc::new(DefaultSourceManager::default());
     let tx_script_code = create_mint_tx_script_code(
@@ -337,19 +337,61 @@ async fn mint_wrong_domain_fails() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Fee splitting is not implemented in the current UsdcxMintPolicy check_policy.
+/// Verifies that minting fails when fee_amount exceeds max_fee.
 ///
-/// The attestation message format is `merge(NONCE, [amount, domain_id, 0, 0])` with no
-/// separate max_fee field. Fee enforcement would require extending the message format
-/// and adding fee-splitting logic to check_policy. This test documents that the feature
-/// is not yet available.
+/// The signed message includes max_fee. The relayer passes fee_amount in the
+/// advice data. check_policy asserts fee_amount <= max_fee (MINT-PRE-9).
 #[tokio::test]
-#[ignore = "fee splitting not implemented: message format has no max_fee field, check_policy has no fee logic"]
 async fn mint_fee_exceeds_max_fee_fails() -> anyhow::Result<()> {
-    // This test is intentionally left as ignored with an explanatory message.
-    // When fee splitting is added to check_policy, implement:
-    // 1. Extend the attestation message to include max_fee
-    // 2. Test that fee_amount > max_fee causes check_policy to reject
+    let attester_sk = make_attester_keypair(42);
+    let pk_comm = attester_pk_comm(&attester_sk);
+
+    let owner_id = test_owner_id();
+    let faucet = create_test_usdcx_faucet_existing_with_attesters(owner_id, vec![pk_comm])?;
+
+    let mut builder = MockChain::builder();
+    builder.add_account(faucet.clone())?;
+    let mock_chain = builder.build()?;
+
+    let amount: u64 = 100_000;
+    let recipient = Word::from([10u32, 20, 30, 40]);
+    let nonce = Word::new([
+        Felt::new_unchecked(1),
+        Felt::new_unchecked(2),
+        Felt::new_unchecked(3),
+        Felt::new_unchecked(4),
+    ]);
+
+    // max_fee = 50, but fee_amount = 100 (exceeds max_fee)
+    let max_fee: u64 = 50;
+    let fee_amount: u64 = 100;
+    let advice = attestation_advice(&attester_sk, nonce, amount, TEST_DOMAIN_ID, max_fee, fee_amount);
+
+    let source_manager = Arc::new(DefaultSourceManager::default());
+    let tx_script_code = create_mint_tx_script_code(
+        faucet.id().prefix().as_felt(),
+        faucet.id().suffix(),
+        amount,
+        0,
+        NoteType::Private,
+        recipient,
+    );
+    let tx_script = CodeBuilder::with_source_manager(source_manager.clone())
+        .compile_tx_script(tx_script_code)?;
+
+    let tx_context = mock_chain
+        .build_tx_context(faucet.id(), &[], &[])?
+        .tx_script(tx_script)
+        .with_source_manager(source_manager)
+        .extend_advice_inputs(advice)
+        .build()?;
+
+    let result = tx_context.execute().await;
+    assert!(
+        result.is_err(),
+        "expected transaction to fail when fee_amount exceeds max_fee"
+    );
+
     Ok(())
 }
 
@@ -394,7 +436,7 @@ async fn mint_while_paused_fails() -> anyhow::Result<()> {
         Felt::new_unchecked(4),
     ]);
 
-    let advice = attestation_advice(&attester_sk, nonce, amount, TEST_DOMAIN_ID);
+    let advice = attestation_advice(&attester_sk, nonce, amount, TEST_DOMAIN_ID, 0, 0);
 
     let mint_source_manager = Arc::new(DefaultSourceManager::default());
     let tx_script_code = create_mint_tx_script_code(

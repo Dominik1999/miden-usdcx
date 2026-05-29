@@ -72,11 +72,11 @@ pub fn attester_pk_comm(sk: &AuthSecretKey) -> Word {
 /// Computes the deposit message: merge(NONCE, [amount, domain_id, 0, 0]).
 ///
 /// This must match the MASM computation in check_policy exactly.
-pub fn deposit_message(nonce: Word, amount: u64, domain_id: u32) -> Word {
+pub fn deposit_message(nonce: Word, amount: u64, domain_id: u32, max_fee: u64) -> Word {
     let amount_word = Word::new([
         Felt::new_unchecked(amount),
         Felt::new_unchecked(domain_id as u64),
-        ZERO,
+        Felt::new_unchecked(max_fee),
         ZERO,
     ]);
     Hasher::merge(&[nonce, amount_word])
@@ -94,16 +94,21 @@ pub const ATTESTATION_DATA_KEY: Word = Word::new([
 /// Builds advice inputs for attestation verification in check_policy.
 ///
 /// The advice map carries:
-/// - `ATTESTATION_DATA_KEY` -> [PK_COMM(4), NONCE(4)]
+/// - `ATTESTATION_DATA_KEY` -> [PK_COMM(4), NONCE(4), fee_amount, max_fee, 0, 0]
 /// - `merge(PK_COMM, MESSAGE)` -> prepared ECDSA secp256k1 signature
+///
+/// The `fee_amount` is what the relayer claims. The `max_fee` is baked into the
+/// signed message. check_policy asserts `fee_amount <= max_fee`.
 pub fn attestation_advice(
     attester_sk: &AuthSecretKey,
     nonce: Word,
     amount: u64,
     domain_id: u32,
+    max_fee: u64,
+    fee_amount: u64,
 ) -> AdviceInputs {
     let pk_comm = attester_pk_comm(attester_sk);
-    let message = deposit_message(nonce, amount, domain_id);
+    let message = deposit_message(nonce, amount, domain_id, max_fee);
 
     // Sign the message
     let sig = attester_sk.sign(message);
@@ -112,10 +117,14 @@ pub fn attestation_advice(
     // Compute the advice map key for the signature: merge(PK_COMM, MESSAGE)
     let sig_key = Hasher::merge(&[pk_comm, message]);
 
-    // Build the attestation data value: [pk0, pk1, pk2, pk3, n0, n1, n2, n3]
+    // Build the attestation data: [PK_COMM(4), NONCE(4), fee_amount, max_fee, 0, 0]
     let mut attestation_data: Vec<Felt> = Vec::new();
     attestation_data.extend(pk_comm.as_elements());
     attestation_data.extend(nonce.as_elements());
+    attestation_data.push(Felt::new_unchecked(fee_amount));
+    attestation_data.push(Felt::new_unchecked(max_fee));
+    attestation_data.push(ZERO);
+    attestation_data.push(ZERO);
 
     AdviceInputs::default()
         .with_map([

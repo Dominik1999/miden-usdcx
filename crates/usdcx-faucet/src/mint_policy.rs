@@ -37,13 +37,14 @@ const USDCX_MINT_POLICY_MASM: &str = "
     const NONCE_USED=[1, 0, 0, 0]
     const ATTESTER_ACTIVE=[1, 0, 0, 0]
 
-    # Well-known advice map key for the attestation data (PK_COMM + NONCE).
-    # The relayer puts [pk0, pk1, pk2, pk3, n0, n1, n2, n3] under this key
-    # in the advice map before building the transaction.
+    # Well-known advice map key for the attestation data.
+    # The relayer puts [PK_COMM(4), NONCE(4), fee_amount, max_fee, 0, 0]
+    # under this key in the advice map before building the transaction.
     const ATTESTATION_DATA_KEY=[3735928559, 3405691582, 3735928559, 3405691582]
 
     const ERR_ATTESTER_NOT_APPROVED=\"attester public key commitment not in registry\"
     const ERR_NONCE_ALREADY_USED=\"deposit intent nonce has already been used\"
+    const ERR_FEE_EXCEEDS_MAX_FEE=\"fee_amount exceeds max_fee from the signed deposit intent\"
 
     # PROCEDURES
     # ============================================================================================
@@ -105,9 +106,6 @@ const USDCX_MINT_POLICY_MASM: &str = "
         # => [NONCE, PK_COMM, amount, tag, note_type, RECIPIENT]
 
         # 6. Mark nonce as used in storage
-        # set_map_item needs [slot_suffix, slot_prefix, KEY, VALUE]
-        # VALUE = NONCE_USED = [1,0,0,0] but we need to store it reversed
-        # Actually, let's just store [1,0,0,0] and the read reversal is consistent
         dupw
         push.NONCE_USED swapw
         push.NONCES_SLOT[0..2]
@@ -115,26 +113,50 @@ const USDCX_MINT_POLICY_MASM: &str = "
         dropw
         # => [NONCE, PK_COMM, amount, tag, note_type, RECIPIENT]
 
-        # 7. Compute MESSAGE = merge(NONCE, [amount, domain_id, 0, 0])
+        # 7. Read fee data from advice stack: [fee_amount, max_fee, 0, 0]
+        padw adv_loadw
+        # => [fee_amount, max_fee, 0, 0, NONCE, PK_COMM, amount, tag, note_type, RECIPIENT]
+
+        # Assert fee_amount <= max_fee (MINT-PRE-9)
+        # u32lte checks: second <= top. With [fee_amount, max_fee] after swap
+        # we get [max_fee, fee_amount], and u32lte checks fee_amount <= max_fee.
+        dup.1 dup.1 swap u32assert2 u32lte
+        assert.err=ERR_FEE_EXCEEDS_MAX_FEE
+        # => [fee_amount, max_fee, 0, 0, NONCE, PK_COMM, amount, tag, note_type, RECIPIENT]
+
+        # Drop fee_amount and padding, keep max_fee
+        # Stack: [fee_amount, max_fee, 0, 0, NONCE, PK_COMM, amount, tag, note_type, RECIPIENT]
+        drop swap drop swap drop
+        # => [max_fee, NONCE, PK_COMM, amount, tag, note_type, RECIPIENT]
+
+        # 8. Compute MESSAGE = merge(NONCE, [amount, domain_id, max_fee, 0])
+        #
+        # Read domain_id from config
         push.DOMAIN_CONFIG_SLOT[0..2]
         exec.active_account::get_item
-        # => [CONFIG_WORD(4), NONCE, PK_COMM, amount, tag, note_type, RECIPIENT]
-        # CONFIG_WORD is also reversed on stack: stored [domain_id, min_burn, 0, 0]
+        # => [CONFIG_WORD(4), max_fee, NONCE, PK_COMM, amount, tag, note_type, RECIPIENT]
+        # CONFIG_WORD reversed on stack: stored [domain_id, min_burn, 0, 0]
         # appears as [0, 0, min_burn, domain_id] on stack
-        # domain_id is at position 3 of the returned word
         movdn.3 drop drop drop
-        # => [domain_id, NONCE(4), PK_COMM(4), amount, tag, note_type, RECIPIENT(4)]
+        # => [domain_id, max_fee, NONCE(4), PK_COMM(4), amount, tag, note_type, RECIPIENT(4)]
+        #     pos 0      pos 1    pos 2-5   pos 6-9    pos 10  pos 11 pos 12   pos 13-16
 
-        # Build AMOUNT_WORD = [amount, domain_id, 0, 0]
-        dup.9 swap push.0 push.0
-        movup.3 movup.3 swap
-        # => [amount, domain_id, 0, 0, NONCE, PK_COMM, amount, tag, note_type, RECIPIENT]
+        # Build AMOUNT_WORD = [amount, domain_id, max_fee, 0] for the message hash.
+        # Stack: [domain_id, max_fee, NONCE(4), PK_COMM(4), amount, tag, note_type, RECIPIENT(4)]
+        #         pos 0      pos 1    pos 2-5   pos 6-9    pos 10
+        #
+        # Strategy: dup amount from pos 10, push 0, then use movup.3 x3 to
+        # reorder [0, amount, domain_id, max_fee, ...] into [amount, domain_id, max_fee, 0, ...]
+        # The original domain_id (pos 0) and max_fee (pos 1) get absorbed into
+        # the AMOUNT_WORD via the movup.3 operations, leaving NONCE cleanly below.
+        dup.10 push.0 movup.3 movup.3 movup.3
+        # => [amount, domain_id, max_fee, 0, NONCE(4), PK_COMM(4), amount, tag, note_type, RECIPIENT(4)]
 
         swapw
         exec.poseidon2::merge
         # => [MESSAGE(4), PK_COMM(4), amount, tag, note_type, RECIPIENT(4)]
 
-        # 8. Verify ECDSA secp256k1 signature (following x402 pattern)
+        # 9. Verify ECDSA secp256k1 signature (following x402 pattern)
         swapw
         # => [PK_COMM, MESSAGE, amount, tag, note_type, RECIPIENT]
 

@@ -62,7 +62,7 @@ async fn try_mint(
         Felt::new_unchecked(nonce_seed + 3),
     ]);
 
-    let advice = attestation_advice(attester_sk, nonce, amount, TEST_DOMAIN_ID);
+    let advice = attestation_advice(attester_sk, nonce, amount, TEST_DOMAIN_ID, 0, 0);
     let source_manager = Arc::new(DefaultSourceManager::default());
     let tx_script_code = create_mint_tx_script_code(
         faucet.id().prefix().as_felt(),

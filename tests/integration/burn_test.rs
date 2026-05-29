@@ -82,7 +82,7 @@ async fn mint_tokens(
     nonce: Word,
 ) -> anyhow::Result<()> {
     let recipient = Word::from([10u32, 20, 30, 40]);
-    let advice = attestation_advice(attester_sk, nonce, amount, TEST_DOMAIN_ID);
+    let advice = attestation_advice(attester_sk, nonce, amount, TEST_DOMAIN_ID, 0, 0);
 
     let source_manager = Arc::new(DefaultSourceManager::default());
     let tx_script_code = create_mint_tx_script_code(
