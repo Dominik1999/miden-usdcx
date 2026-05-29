@@ -214,7 +214,7 @@ Every requirement from Circle's [USDC-backed Stablecoin Specification](https://d
 
 | ID | Circle Precondition | Implementation | Code |
 |---|---|---|---|
-| MINT-PRE-1 | ECDSA.recover(hash, sig) must resolve to address in `xReserveAttesters` | Compute `PK_COMM = Poseidon2(PK)`, look up in `attesters` map, call `ecdsa_k256_keccak::verify(PK_COMM, MSG)`. Uses PK_COMM-based lookup (equivalent security). | [`mint_policy.rs`](crates/usdcx-faucet/src/mint_policy.rs) - `check_policy` (MVP: pass-through; full ECDSA implementation pending) |
+| MINT-PRE-1 | ECDSA.recover(hash, sig) must resolve to address in `xReserveAttesters` | Compute `PK_COMM = Poseidon2(PK)`, look up in `attesters` map, call `ecdsa_k256_keccak::verify(PK_COMM, MSG)`. Uses PK_COMM-based lookup (equivalent security). | [`mint_policy.rs`](crates/usdcx-faucet/src/mint_policy.rs) - `check_policy` verifies ECDSA signature via `ecdsa_k256_keccak::verify` |
 | MINT-PRE-2 | `depositIntent.magic` must be `0x5a2e0acd` | Validated in `DepositIntent::validate()` (Rust-side). Will be validated in MASM when full attestation check is implemented. | [`deposit_intent.rs`](crates/usdcx-faucet/src/deposit_intent.rs#L43-L45) |
 | MINT-PRE-3 | `depositIntent.version` must be `1` | Validated in `DepositIntent::validate()`. | [`deposit_intent.rs`](crates/usdcx-faucet/src/deposit_intent.rs#L46-L48) |
 | MINT-PRE-4 | `depositIntent.amount` must be > 0 | Validated in `DepositIntent::validate()`. | [`deposit_intent.rs`](crates/usdcx-faucet/src/deposit_intent.rs#L49-L51) |
@@ -238,8 +238,8 @@ Every requirement from Circle's [USDC-backed Stablecoin Specification](https://d
 
 | ID | Circle Postcondition | Implementation | Verified By |
 |---|---|---|---|
-| MINT-POST-1 | `totalSupply` == previous + `amount` | `FungibleFaucet` enforces this invariant internally. | Integration tests (pending ECDSA) |
-| MINT-POST-2 | Sum of balances increased by `amount` | Two output notes created with assets summing to `amount`. | Integration tests (pending ECDSA) |
+| MINT-POST-1 | `totalSupply` == previous + `amount` | `FungibleFaucet` enforces this invariant internally. | Integration tests |
+| MINT-POST-2 | Sum of balances increased by `amount` | Two output notes created with assets summing to `amount`. | Integration tests |
 | MINT-POST-3 | Emit mint event | Miden has no EVM-style event log. Output notes (recipient + relayer) are publicly observable on-chain. Note metadata + transaction record serve as the audit trail. **Deviation from spec - flagged to Circle.** | Note observability |
 
 ### burn() Preconditions
@@ -314,7 +314,7 @@ miden-usdcx/
         nonce_registry.rs       # NonceRegistry - replay protection
         domain_config.rs        # DomainConfig - domain ID + minBurnSize
         deposit_intent.rs       # DepositIntent - Circle deposit intent parsing
-    usdcx-relayer/              # Off-chain relayer skeleton (stubs)
+    usdcx-relayer/              # Off-chain relayer service
       src/
         circle_api.rs           # Circle xReserve API client
         deposit_monitor.rs      # Ethereum deposit watcher
@@ -324,9 +324,9 @@ miden-usdcx/
     integration/                # MockChain integration tests
       faucet_test.rs            # Faucet creation and storage verification
       admin_test.rs             # Attester management, min burn size updates
-      mint_test.rs              # Mint flow tests (pending ECDSA)
-      burn_test.rs              # Burn flow tests (pending full flow)
-      blocklist_test.rs         # Blocklist tests (pending full flow)
+      mint_test.rs              # Mint flow tests (ECDSA attestation verification)
+      burn_test.rs              # Burn flow tests (minBurnSize enforcement)
+      blocklist_test.rs         # Blocklist enforcement tests
 ```
 
 ## Building
