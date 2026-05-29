@@ -30,7 +30,7 @@ Step-by-step walkthrough of the USDCx mint flow, from the relayer preparing the 
 
 - `PK_COMM` = Poseidon2 hash of the attester's compressed secp256k1 public key
 - `NONCE` = unique 32-byte deposit nonce (from Circle's deposit intent)
-- `MESSAGE` = `Poseidon2::merge(NONCE, [amount, domain_id, 0, 0])` - a domain-bound commitment to the deposit
+- `MESSAGE` = `Poseidon2::merge(NONCE, [amount, domain_id, max_fee, 0])` - a domain-bound commitment to the deposit including the fee cap
 
 **Step 2 - Sign and build the advice map.** The relayer signs the message and encodes it for the Miden VM:
 
@@ -44,7 +44,7 @@ Two entries go into the advice map (a key-value store passed alongside the trans
 
 | Key | Value |
 |---|---|
-| `ATTESTATION_DATA_KEY` (well-known constant) | `[pk_comm(4 felts), nonce(4 felts)]` |
+| `ATTESTATION_DATA_KEY` (well-known constant) | `[pk_comm(4 felts), nonce(4 felts), fee_amount, max_fee, 0, 0]` |
 | `merge(pk_comm, message)` | prepared ECDSA signature (~26 felts) |
 
 **Step 3 - Build the transaction script.** The tx script pushes mint parameters onto the stack and calls `mint_and_send`. The output is a **standard P2ID note** - the same note type used for all Miden token transfers. The tag is set to `NoteTag::with_account_target(recipient_id)` so Alice's Miden client discovers the note during sync.
@@ -78,8 +78,9 @@ end
 | 6d | Read `NONCE` from advice stack via `adv_loadw`. | - |
 | 6e | Look up NONCE in the `used_nonces` storage map. Assert value is `[0,0,0,0]` (unused). | PANIC: "deposit intent nonce has already been used" |
 | 6f | Write `[1,0,0,0]` to `used_nonces` map at NONCE key. Nonce is now consumed. | - |
-| 6g | Read `domain_id` from `domain_config` slot. Compute `MESSAGE = Poseidon2::merge(NONCE, [amount, domain_id, 0, 0])`. | - |
-| 6h | Compute `SIG_KEY = Poseidon2::merge(PK_COMM, MESSAGE)`. Fetch prepared signature from advice map via `adv.push_mapval`. Call `ecdsa_k256_keccak::verify` which consumes `[PK_COMM, MESSAGE]` from the stack and the signature from the advice stack. | PANIC: signature verification failed |
+| 6g | Read `fee_amount` and `max_fee` from advice data. Assert `fee_amount <= max_fee`. | PANIC: "fee_amount exceeds max_fee from the signed deposit intent" |
+| 6h | Read `domain_id` from `domain_config` slot. Compute `MESSAGE = Poseidon2::merge(NONCE, [amount, domain_id, max_fee, 0])`. | - |
+| 6i | Compute `SIG_KEY = Poseidon2::merge(PK_COMM, MESSAGE)`. Fetch prepared signature from advice map via `adv.push_mapval`. Call `ecdsa_k256_keccak::verify` which consumes `[PK_COMM, MESSAGE]` from the stack and the signature from the advice stack. | PANIC: signature verification failed |
 
 Stack on exit: `[amount, tag, note_type, RECIPIENT]` (unchanged - passed back to `mint_and_send`).
 
@@ -109,8 +110,9 @@ The mint output is a standard P2ID note - it uses the same note type as all Mide
 | Attester is approved | Step 6c - registry lookup | MINT-PRE-1 |
 | Nonce not replayed | Step 6e - nonce registry | MINT-PRE-10 |
 | Nonce marked used | Step 6f - storage write | MINT-STATE-1 |
-| Domain matches faucet | Step 6g - domain_id baked into signed message | MINT-PRE-5 |
-| Signature valid (ECDSA secp256k1) | Step 6h - `ecdsa_k256_keccak::verify` | MINT-PRE-1 |
+| Fee within limit | Step 6g - `fee_amount <= max_fee` | MINT-PRE-9 |
+| Domain matches faucet | Step 6h - domain_id baked into signed message | MINT-PRE-5 |
+| Signature valid (ECDSA secp256k1) | Step 6i - `ecdsa_k256_keccak::verify` | MINT-PRE-1 |
 | Faucet not paused | Step 5 - `execute_mint_policy` checks before dynexec | Operational safety |
 | Supply cap respected | Step 7 - `mint_and_send` validates supply | STATE-6 |
 
@@ -222,7 +224,7 @@ Every requirement from Circle's [USDC-backed Stablecoin Specification](https://d
 | MINT-PRE-6 | `depositIntent.remoteToken` must match stablecoin contract | Validated in `DepositIntent::validate()` against `faucet_id`. MASM compares against `active_account::get_id`. | [`deposit_intent.rs`](crates/usdcx-faucet/src/deposit_intent.rs#L57-L59) |
 | MINT-PRE-7 | `localToken` and `localDepositor` must not be zero | Validated in `DepositIntent::validate()`. | [`deposit_intent.rs`](crates/usdcx-faucet/src/deposit_intent.rs#L60-L65) |
 | MINT-PRE-8 | `amount` must be at least `maxFee` | Validated in `DepositIntent::validate()`. | [`deposit_intent.rs`](crates/usdcx-faucet/src/deposit_intent.rs#L66-L68) |
-| MINT-PRE-9 | `maxFee` must be >= passed `feeAmount` | Will be validated in MASM `check_policy` when full attestation is implemented. | [`mint_policy.rs`](crates/usdcx-faucet/src/mint_policy.rs) - MASM `check_policy` |
+| MINT-PRE-9 | `maxFee` must be >= passed `feeAmount` | `check_policy` reads `fee_amount` and `max_fee` from the advice map attestation data, asserts `fee_amount <= max_fee` via `u32lte`. The `max_fee` is baked into the signed message `merge(NONCE, [amount, domain_id, max_fee, 0])`. | [`mint_policy.rs`](crates/usdcx-faucet/src/mint_policy.rs) - MASM `check_policy` step 7 |
 | MINT-PRE-10 | `usedNonces[nonce]` must be `false` | `NonceRegistry` storage map lookup. MASM reads `NONCES_SLOT` and asserts value is zero word. | [`nonce_registry.rs`](crates/usdcx-faucet/src/nonce_registry.rs) - `NONCES_SLOT` in MASM |
 
 ### mint() State Transitions
@@ -338,20 +340,20 @@ cargo test -p usdcx-faucet --test integration   # Run integration tests
 
 ## Test Results
 
-22 of 23 integration tests passing. All core flows verified via MockChain with `prove_and_verify`.
+All 23 integration tests passing. All core flows verified via MockChain.
 
 | Category | Tests | Status |
 |---|---|---|
 | **Faucet creation** | `faucet_creation_succeeds`, `faucet_has_correct_domain_config`, `faucet_has_initial_attester` | 3/3 pass |
-| **Mint (attestation)** | `mint_with_valid_attestation_succeeds`, `mint_with_unknown_attester_fails`, `mint_nonce_replay_fails`, `mint_wrong_domain_fails`, `mint_while_paused_fails`, `mint_zero_amount_fails` | 5/5 pass |
+| **Mint (attestation)** | `mint_with_valid_attestation_succeeds`, `mint_with_unknown_attester_fails`, `mint_nonce_replay_fails`, `mint_wrong_domain_fails`, `mint_while_paused_fails`, `mint_zero_amount_fails`, `mint_fee_exceeds_max_fee_fails` | 7/7 pass |
 | **Burn** | `burn_above_min_succeeds`, `burn_below_min_fails`, `burn_min_size_update_enforced`, `burn_while_paused_fails` | 4/4 pass |
 | **Admin** | `owner_can_add_attester`, `owner_can_remove_attester`, `owner_can_set_min_burn_size`, `non_owner_cannot_add_attester`, `pause_unpause_cycle`, `ownership_transfer_two_step` | 6/6 pass |
 | **Blocklist** | `blocked_account_transfer_rejected`, `unblocked_account_transfer_succeeds`, `non_owner_blocklist_fails` | 3/3 pass |
-| **Fee splitting** | `mint_fee_exceeds_max_fee_fails` | 1 ignored (message format has no max_fee field) |
 
 ## Current Status
 
-- ECDSA secp256k1 attestation verification fully implemented in `check_policy` (attester registry lookup, nonce replay protection, domain-bound message verification via `ecdsa_k256_keccak::verify`)
+- ECDSA secp256k1 attestation verification fully implemented in `check_policy` (attester registry lookup, nonce replay protection, fee limit enforcement, domain-bound message verification via `ecdsa_k256_keccak::verify`)
+- Attestation message format: `merge(NONCE, [amount, domain_id, max_fee, 0])` - includes fee cap signed by attester
 - `mint_with_attestation` procedure implemented with fee-splitting mint (two output notes: recipient + relayer)
 - Burn policy fully functional with minBurnSize enforcement and owner-gated configuration
 - Blocklist enforcement tested end-to-end (block, unblock, non-owner rejection)
