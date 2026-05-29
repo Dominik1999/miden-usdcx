@@ -293,6 +293,23 @@ Intentional adaptations to Miden's architecture. Each should be flagged to Circl
 | Transfer restrictions | Not in Circle's base spec | Blocklist on send+receive via `BasicBlocklist` | Added for OFAC/sanctions compliance. Not required by Circle but expected by regulators. |
 | Pausability | Not in Circle's base spec | `Pausable` component halts all operations | Added for operational safety. Common in regulated stablecoin contracts. |
 
+### bytes32 Encoding (Goldilocks Field Safety)
+
+Circle's spec uses `bytes32` for nonces, token addresses, and depositor addresses. Miden's field element (`Felt`) uses the Goldilocks prime (p = 2^64 - 2^32 + 1), which means naively packing 8 raw bytes into a u64 Felt can silently overflow mod p and corrupt the data.
+
+We follow the [AggLayer's `build_felt` pattern](https://github.com/0xMiden/protocol/blob/next/crates/miden-agglayer/asm/agglayer/common/eth_address.masm#L82-L114): 32 bytes are split into 8 little-endian u32 limbs, then paired into 4 felts via `(hi * 2^32) + lo`. Each packed value is validated against the Goldilocks prime to ensure no silent reduction occurs.
+
+```rust
+use usdcx_faucet::deposit_intent::{bytes32_to_word, word_to_bytes32};
+
+let nonce_bytes: [u8; 32] = /* from Circle deposit intent */;
+let nonce_word = bytes32_to_word(&nonce_bytes);   // safe: panics if any felt would overflow
+let recovered = word_to_bytes32(nonce_word);       // roundtrip back to bytes
+assert_eq!(nonce_bytes, recovered);
+```
+
+This encoding applies to the `nonce`, `local_token`, and `local_depositor` fields in [`DepositIntent`](crates/usdcx-faucet/src/deposit_intent.rs). Scalar values (`amount`, `max_fee`, `domain_id`) are small enough to fit safely in a single Felt without packing.
+
 ### Additional Miden Capabilities (Beyond Circle Spec)
 
 | Feature | Implementation | Rationale |
