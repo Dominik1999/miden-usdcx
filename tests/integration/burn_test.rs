@@ -2,13 +2,13 @@ use std::sync::Arc;
 
 use miden_protocol::assembly::DefaultSourceManager;
 use miden_protocol::asset::{Asset, FungibleAsset};
-use miden_protocol::note::{NoteAttachments, NoteType};
+use miden_protocol::note::NoteType;
 use miden_protocol::transaction::RawOutputNote;
 use miden_protocol::{Felt, Word};
 use miden_standards::code_builder::CodeBuilder;
 use miden_protocol::crypto::rand::RandomCoin;
-use miden_standards::note::BurnNote;
 use miden_testing::MockChain;
+use usdcx_faucet::burn_note::UsdcxBurnNote;
 
 use crate::helpers::*;
 
@@ -48,7 +48,18 @@ fn create_mint_tx_script_code(
     )
 }
 
-/// Creates a burn note using the standard BurnNote from miden-standards.
+/// Default destination domain for tests (Ethereum = 0).
+const TEST_DESTINATION_DOMAIN: u32 = 0;
+
+/// Default destination recipient for tests (a mock Ethereum address padded to 32 bytes).
+const TEST_DESTINATION_RECIPIENT: [u8; 32] = [
+    0xde, 0xad, 0xbe, 0xef, 0x00, 0x00, 0x00, 0x00,
+    0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+    0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11,
+    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+];
+
+/// Creates a USDCx burn note with destination data in storage.
 fn create_burn_note(
     sender: miden_protocol::account::AccountId,
     faucet_id: miden_protocol::account::AccountId,
@@ -63,11 +74,12 @@ fn create_burn_note(
         Felt::new_unchecked(rng_seed + 3),
     ]);
     let mut rng = RandomCoin::new(seed_word);
-    let note = BurnNote::create(
+    let note = UsdcxBurnNote::create(
         sender,
         faucet_id,
         asset,
-        NoteAttachments::default(),
+        TEST_DESTINATION_DOMAIN,
+        &TEST_DESTINATION_RECIPIENT,
         &mut rng,
     )?;
     Ok(note)
