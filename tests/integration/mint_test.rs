@@ -3,6 +3,7 @@ use std::sync::Arc;
 use miden_protocol::account::AccountId;
 use miden_protocol::assembly::DefaultSourceManager;
 use miden_protocol::note::{NoteTag, NoteType};
+use miden_protocol::testing::account_id::AccountIdBuilder;
 use miden_protocol::transaction::RawOutputNote;
 use miden_protocol::{Felt, Word};
 use miden_standards::code_builder::CodeBuilder;
@@ -508,5 +509,228 @@ async fn mint_zero_amount_fails() -> anyhow::Result<()> {
     let result = tx_context.execute().await;
     assert!(result.is_err(), "expected transaction to fail for zero amount");
 
+    Ok(())
+}
+
+// MINT-PRE-2: magic must be 0x5a2e0acd
+#[tokio::test]
+async fn mint_invalid_magic_fails() -> anyhow::Result<()> {
+    let attester_sk = make_attester_keypair(42);
+    let pk_comm = attester_pk_comm(&attester_sk);
+    let owner_id = test_owner_id();
+    let faucet = create_test_usdcx_faucet_existing_with_attesters(owner_id, vec![pk_comm])?;
+
+    let mut builder = MockChain::builder();
+    builder.add_account(faucet.clone())?;
+    let mock_chain = builder.build()?;
+
+    let amount: u64 = 100_000;
+    let nonce = Word::new([Felt::new_unchecked(1), Felt::new_unchecked(2), Felt::new_unchecked(3), Felt::new_unchecked(4)]);
+    let mut intent = test_deposit_intent(faucet.id(), amount, 0, nonce);
+    intent.magic = 0xDEADBEEF; // wrong magic
+
+    let advice = attestation_advice(&attester_sk, &intent, 0);
+    let source_manager = Arc::new(DefaultSourceManager::default());
+    let tx_script = CodeBuilder::with_source_manager(source_manager.clone())
+        .compile_tx_script(create_mint_tx_script_code(
+            faucet.id().prefix().as_felt(), faucet.id().suffix(),
+            amount, 0, NoteType::Private, Word::from([10u32, 20, 30, 40]),
+        ))?;
+
+    let tx_context = mock_chain
+        .build_tx_context(faucet.id(), &[], &[])?
+        .tx_script(tx_script)
+        .with_source_manager(source_manager)
+        .extend_advice_inputs(advice)
+        .build()?;
+
+    let result = tx_context.execute().await;
+    assert!(result.is_err(), "expected transaction to fail with invalid magic");
+    Ok(())
+}
+
+// MINT-PRE-3: version must be 1
+#[tokio::test]
+async fn mint_invalid_version_fails() -> anyhow::Result<()> {
+    let attester_sk = make_attester_keypair(42);
+    let pk_comm = attester_pk_comm(&attester_sk);
+    let owner_id = test_owner_id();
+    let faucet = create_test_usdcx_faucet_existing_with_attesters(owner_id, vec![pk_comm])?;
+
+    let mut builder = MockChain::builder();
+    builder.add_account(faucet.clone())?;
+    let mock_chain = builder.build()?;
+
+    let amount: u64 = 100_000;
+    let nonce = Word::new([Felt::new_unchecked(5), Felt::new_unchecked(6), Felt::new_unchecked(7), Felt::new_unchecked(8)]);
+    let mut intent = test_deposit_intent(faucet.id(), amount, 0, nonce);
+    intent.version = 99; // wrong version
+
+    let advice = attestation_advice(&attester_sk, &intent, 0);
+    let source_manager = Arc::new(DefaultSourceManager::default());
+    let tx_script = CodeBuilder::with_source_manager(source_manager.clone())
+        .compile_tx_script(create_mint_tx_script_code(
+            faucet.id().prefix().as_felt(), faucet.id().suffix(),
+            amount, 0, NoteType::Private, Word::from([10u32, 20, 30, 40]),
+        ))?;
+
+    let tx_context = mock_chain
+        .build_tx_context(faucet.id(), &[], &[])?
+        .tx_script(tx_script)
+        .with_source_manager(source_manager)
+        .extend_advice_inputs(advice)
+        .build()?;
+
+    let result = tx_context.execute().await;
+    assert!(result.is_err(), "expected transaction to fail with invalid version");
+    Ok(())
+}
+
+// MINT-PRE-6: remoteToken must match faucet
+#[tokio::test]
+async fn mint_wrong_remote_token_fails() -> anyhow::Result<()> {
+    let attester_sk = make_attester_keypair(42);
+    let pk_comm = attester_pk_comm(&attester_sk);
+    let owner_id = test_owner_id();
+    let faucet = create_test_usdcx_faucet_existing_with_attesters(owner_id, vec![pk_comm])?;
+
+    let mut builder = MockChain::builder();
+    builder.add_account(faucet.clone())?;
+    let mock_chain = builder.build()?;
+
+    let amount: u64 = 100_000;
+    let nonce = Word::new([Felt::new_unchecked(9), Felt::new_unchecked(10), Felt::new_unchecked(11), Felt::new_unchecked(12)]);
+    let wrong_token_id = AccountIdBuilder::new().build_with_seed([99; 32]);
+    let mut intent = test_deposit_intent(faucet.id(), amount, 0, nonce);
+    intent.remote_token = wrong_token_id; // wrong token
+
+    let advice = attestation_advice(&attester_sk, &intent, 0);
+    let source_manager = Arc::new(DefaultSourceManager::default());
+    let tx_script = CodeBuilder::with_source_manager(source_manager.clone())
+        .compile_tx_script(create_mint_tx_script_code(
+            faucet.id().prefix().as_felt(), faucet.id().suffix(),
+            amount, 0, NoteType::Private, Word::from([10u32, 20, 30, 40]),
+        ))?;
+
+    let tx_context = mock_chain
+        .build_tx_context(faucet.id(), &[], &[])?
+        .tx_script(tx_script)
+        .with_source_manager(source_manager)
+        .extend_advice_inputs(advice)
+        .build()?;
+
+    let result = tx_context.execute().await;
+    assert!(result.is_err(), "expected transaction to fail with wrong remoteToken");
+    Ok(())
+}
+
+// MINT-PRE-7: localToken must not be zero
+#[tokio::test]
+async fn mint_zero_local_token_fails() -> anyhow::Result<()> {
+    let attester_sk = make_attester_keypair(42);
+    let pk_comm = attester_pk_comm(&attester_sk);
+    let owner_id = test_owner_id();
+    let faucet = create_test_usdcx_faucet_existing_with_attesters(owner_id, vec![pk_comm])?;
+
+    let mut builder = MockChain::builder();
+    builder.add_account(faucet.clone())?;
+    let mock_chain = builder.build()?;
+
+    let amount: u64 = 100_000;
+    let nonce = Word::new([Felt::new_unchecked(13), Felt::new_unchecked(14), Felt::new_unchecked(15), Felt::new_unchecked(16)]);
+    let mut intent = test_deposit_intent(faucet.id(), amount, 0, nonce);
+    intent.local_token = [0u8; 32]; // zero local token
+
+    let advice = attestation_advice(&attester_sk, &intent, 0);
+    let source_manager = Arc::new(DefaultSourceManager::default());
+    let tx_script = CodeBuilder::with_source_manager(source_manager.clone())
+        .compile_tx_script(create_mint_tx_script_code(
+            faucet.id().prefix().as_felt(), faucet.id().suffix(),
+            amount, 0, NoteType::Private, Word::from([10u32, 20, 30, 40]),
+        ))?;
+
+    let tx_context = mock_chain
+        .build_tx_context(faucet.id(), &[], &[])?
+        .tx_script(tx_script)
+        .with_source_manager(source_manager)
+        .extend_advice_inputs(advice)
+        .build()?;
+
+    let result = tx_context.execute().await;
+    assert!(result.is_err(), "expected transaction to fail with zero localToken");
+    Ok(())
+}
+
+// MINT-PRE-7: localDepositor must not be zero
+#[tokio::test]
+async fn mint_zero_local_depositor_fails() -> anyhow::Result<()> {
+    let attester_sk = make_attester_keypair(42);
+    let pk_comm = attester_pk_comm(&attester_sk);
+    let owner_id = test_owner_id();
+    let faucet = create_test_usdcx_faucet_existing_with_attesters(owner_id, vec![pk_comm])?;
+
+    let mut builder = MockChain::builder();
+    builder.add_account(faucet.clone())?;
+    let mock_chain = builder.build()?;
+
+    let amount: u64 = 100_000;
+    let nonce = Word::new([Felt::new_unchecked(17), Felt::new_unchecked(18), Felt::new_unchecked(19), Felt::new_unchecked(20)]);
+    let mut intent = test_deposit_intent(faucet.id(), amount, 0, nonce);
+    intent.local_depositor = [0u8; 32]; // zero local depositor
+
+    let advice = attestation_advice(&attester_sk, &intent, 0);
+    let source_manager = Arc::new(DefaultSourceManager::default());
+    let tx_script = CodeBuilder::with_source_manager(source_manager.clone())
+        .compile_tx_script(create_mint_tx_script_code(
+            faucet.id().prefix().as_felt(), faucet.id().suffix(),
+            amount, 0, NoteType::Private, Word::from([10u32, 20, 30, 40]),
+        ))?;
+
+    let tx_context = mock_chain
+        .build_tx_context(faucet.id(), &[], &[])?
+        .tx_script(tx_script)
+        .with_source_manager(source_manager)
+        .extend_advice_inputs(advice)
+        .build()?;
+
+    let result = tx_context.execute().await;
+    assert!(result.is_err(), "expected transaction to fail with zero localDepositor");
+    Ok(())
+}
+
+// MINT-PRE-8: amount must be at least maxFee
+#[tokio::test]
+async fn mint_amount_below_max_fee_fails() -> anyhow::Result<()> {
+    let attester_sk = make_attester_keypair(42);
+    let pk_comm = attester_pk_comm(&attester_sk);
+    let owner_id = test_owner_id();
+    let faucet = create_test_usdcx_faucet_existing_with_attesters(owner_id, vec![pk_comm])?;
+
+    let mut builder = MockChain::builder();
+    builder.add_account(faucet.clone())?;
+    let mock_chain = builder.build()?;
+
+    let amount: u64 = 100;
+    let max_fee: u64 = 500; // max_fee > amount
+    let nonce = Word::new([Felt::new_unchecked(21), Felt::new_unchecked(22), Felt::new_unchecked(23), Felt::new_unchecked(24)]);
+    let intent = test_deposit_intent(faucet.id(), amount, max_fee, nonce);
+
+    let advice = attestation_advice(&attester_sk, &intent, 0);
+    let source_manager = Arc::new(DefaultSourceManager::default());
+    let tx_script = CodeBuilder::with_source_manager(source_manager.clone())
+        .compile_tx_script(create_mint_tx_script_code(
+            faucet.id().prefix().as_felt(), faucet.id().suffix(),
+            amount, 0, NoteType::Private, Word::from([10u32, 20, 30, 40]),
+        ))?;
+
+    let tx_context = mock_chain
+        .build_tx_context(faucet.id(), &[], &[])?
+        .tx_script(tx_script)
+        .with_source_manager(source_manager)
+        .extend_advice_inputs(advice)
+        .build()?;
+
+    let result = tx_context.execute().await;
+    assert!(result.is_err(), "expected transaction to fail when amount < maxFee");
     Ok(())
 }
