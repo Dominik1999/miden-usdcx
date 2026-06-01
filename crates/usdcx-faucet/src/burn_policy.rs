@@ -13,7 +13,7 @@ pub const USDCX_BURN_POLICY_NAME: &str = "usdcx::components::burn_policy";
 
 /// MASM source code for the USDCx burn policy component.
 ///
-/// Procedure bodies are stubs; full implementations are deferred to Task 12.
+/// Implements minBurnSize enforcement and owner-gated configuration updates.
 const USDCX_BURN_POLICY_MASM: &str = "
     use miden::protocol::active_account
     use miden::protocol::native_account
