@@ -1,7 +1,7 @@
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
-use crate::circle_api::{Attestation, CircleApiClient, CircleApiError};
+use crate::circle_api::{Attestation, CircleApi, CircleApiError};
 use crate::config::RelayerConfig;
 
 /// An on-chain deposit event detected on the source chain.
@@ -21,14 +21,14 @@ pub struct MintTransaction {
 
 /// Monitors the source chain for xReserve deposit events and builds corresponding
 /// mint transactions for the Miden faucet.
-pub struct DepositMonitor {
+pub struct DepositMonitor<C: CircleApi> {
     config: RelayerConfig,
-    circle_client: CircleApiClient,
+    circle_client: C,
 }
 
-impl DepositMonitor {
+impl<C: CircleApi> DepositMonitor<C> {
     /// Create a new monitor from the given config and Circle API client.
-    pub fn new(config: RelayerConfig, circle_client: CircleApiClient) -> Self {
+    pub fn new(config: RelayerConfig, circle_client: C) -> Self {
         Self { config, circle_client }
     }
 

@@ -1,7 +1,7 @@
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
-use crate::circle_api::{BurnIntent, CircleApiClient, CircleApiError, WithdrawalStatus};
+use crate::circle_api::{BurnIntent, CircleApi, CircleApiError, WithdrawalStatus};
 use crate::config::RelayerConfig;
 
 /// A USDCx burn event detected on Miden.
@@ -20,14 +20,14 @@ pub trait BurnIntentSigner {
 }
 
 /// Coordinates processing of USDCx burn events into Circle xReserve withdrawals.
-pub struct WithdrawalService {
+pub struct WithdrawalService<C: CircleApi> {
     config: RelayerConfig,
-    circle_client: CircleApiClient,
+    circle_client: C,
 }
 
-impl WithdrawalService {
+impl<C: CircleApi> WithdrawalService<C> {
     /// Create a new service from the given config and Circle API client.
-    pub fn new(config: RelayerConfig, circle_client: CircleApiClient) -> Self {
+    pub fn new(config: RelayerConfig, circle_client: C) -> Self {
         Self { config, circle_client }
     }
 
@@ -99,8 +99,6 @@ impl WithdrawalService {
         let prepared = self.circle_client.prepare_withdrawal(vec![intent]).await?;
 
         // Step 2: Collect signatures from all co-signers
-        // Each signer signs the same encoded batch; all signatures are concatenated
-        // into the final submission payload
         let encoded_batch: Vec<u8> = prepared
             .burn_intents
             .iter()
@@ -121,8 +119,6 @@ impl WithdrawalService {
         );
 
         // Step 3: Assemble the signed batch payload
-        // Format: [encoded_batch_len (4 bytes) | encoded_batch | sig_count (4 bytes)
-        //          | for each sig: sig_len (4 bytes) | sig_bytes]
         let mut submission = Vec::new();
         submission.extend_from_slice(&(encoded_batch.len() as u32).to_le_bytes());
         submission.extend_from_slice(&encoded_batch);

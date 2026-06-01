@@ -2,6 +2,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{debug, info};
 
+// TYPES
+// ================================================================================================
+
 /// Attestation returned by Circle for a cross-chain deposit message.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Attestation {
@@ -42,6 +45,40 @@ pub struct BurnIntent {
     pub destination_recipient: String,
 }
 
+// TRAIT
+// ================================================================================================
+
+/// Abstraction over the Circle xReserve API.
+///
+/// The trait allows swapping the real HTTP client for a mock in tests,
+/// enabling end-to-end relayer orchestration tests without Circle credentials.
+#[allow(async_fn_in_trait)]
+pub trait CircleApi {
+    /// Retrieve an attestation for a cross-chain deposit message hash.
+    async fn get_attestation(&self, hash: &str) -> Result<Attestation, CircleApiError>;
+
+    /// Prepare a batch withdrawal from a list of burn intents.
+    async fn prepare_withdrawal(
+        &self,
+        intents: Vec<BurnIntent>,
+    ) -> Result<PreparedWithdrawal, CircleApiError>;
+
+    /// Submit a signed withdrawal batch to Circle.
+    async fn submit_withdrawal(
+        &self,
+        batch: Vec<u8>,
+    ) -> Result<WithdrawalResult, CircleApiError>;
+
+    /// Poll the status of a previously submitted withdrawal.
+    async fn get_withdrawal_status(
+        &self,
+        id: &str,
+    ) -> Result<WithdrawalStatus, CircleApiError>;
+}
+
+// HTTP IMPLEMENTATION
+// ================================================================================================
+
 /// HTTP client for the Circle xReserve API.
 pub struct CircleApiClient {
     base_url: String,
@@ -66,9 +103,10 @@ impl CircleApiClient {
         }
         Ok(resp)
     }
+}
 
-    /// Retrieve an attestation for a cross-chain deposit message hash.
-    pub async fn get_attestation(&self, hash: &str) -> Result<Attestation, CircleApiError> {
+impl CircleApi for CircleApiClient {
+    async fn get_attestation(&self, hash: &str) -> Result<Attestation, CircleApiError> {
         let url = format!("{}/v1/attestations/{}", self.base_url, hash);
         debug!(hash, url, "fetching attestation from Circle API");
 
@@ -84,8 +122,7 @@ impl CircleApiClient {
         Ok(attestation)
     }
 
-    /// Prepare a batch withdrawal from a list of burn intents.
-    pub async fn prepare_withdrawal(
+    async fn prepare_withdrawal(
         &self,
         intents: Vec<BurnIntent>,
     ) -> Result<PreparedWithdrawal, CircleApiError> {
@@ -105,8 +142,7 @@ impl CircleApiClient {
         Ok(prepared)
     }
 
-    /// Submit a signed withdrawal batch to Circle.
-    pub async fn submit_withdrawal(
+    async fn submit_withdrawal(
         &self,
         batch: Vec<u8>,
     ) -> Result<WithdrawalResult, CircleApiError> {
@@ -122,8 +158,7 @@ impl CircleApiClient {
         Ok(result)
     }
 
-    /// Poll the status of a previously submitted withdrawal.
-    pub async fn get_withdrawal_status(
+    async fn get_withdrawal_status(
         &self,
         id: &str,
     ) -> Result<WithdrawalStatus, CircleApiError> {
@@ -138,6 +173,67 @@ impl CircleApiClient {
         Ok(status)
     }
 }
+
+// MOCK IMPLEMENTATION
+// ================================================================================================
+
+/// Mock Circle API that returns canned responses for testing.
+///
+/// Exercises the full relayer orchestration (attestation fetch, withdrawal
+/// prepare/sign/submit/poll) without needing real Circle credentials.
+pub struct MockCircleApi;
+
+impl CircleApi for MockCircleApi {
+    async fn get_attestation(&self, hash: &str) -> Result<Attestation, CircleApiError> {
+        info!(hash, "mock: returning sample attestation");
+        Ok(Attestation {
+            attestation: "0xMOCK_ECDSA_ATTESTATION_SIGNATURE".into(),
+            deposit_message_hash: hash.into(),
+        })
+    }
+
+    async fn prepare_withdrawal(
+        &self,
+        intents: Vec<BurnIntent>,
+    ) -> Result<PreparedWithdrawal, CircleApiError> {
+        info!(intent_count = intents.len(), "mock: preparing withdrawal");
+        let burn_intents = intents
+            .iter()
+            .enumerate()
+            .map(|(i, intent)| EncodedBurnIntent {
+                encoded: format!(
+                    "encoded_intent_{}_amount_{}_domain_{}_recipient_{}",
+                    i, intent.amount, intent.destination_domain, intent.destination_recipient
+                ),
+            })
+            .collect();
+        Ok(PreparedWithdrawal { burn_intents })
+    }
+
+    async fn submit_withdrawal(
+        &self,
+        batch: Vec<u8>,
+    ) -> Result<WithdrawalResult, CircleApiError> {
+        info!(batch_size = batch.len(), "mock: submitting withdrawal");
+        Ok(WithdrawalResult {
+            withdrawal_id: "mock-withdrawal-001".into(),
+        })
+    }
+
+    async fn get_withdrawal_status(
+        &self,
+        id: &str,
+    ) -> Result<WithdrawalStatus, CircleApiError> {
+        info!(id, "mock: returning finalized status");
+        Ok(WithdrawalStatus {
+            id: id.into(),
+            status: "finalized".into(),
+        })
+    }
+}
+
+// ERRORS
+// ================================================================================================
 
 /// Errors returned by the Circle API client.
 #[derive(Debug, Error)]
