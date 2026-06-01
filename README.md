@@ -212,20 +212,22 @@ Every requirement from Circle's [USDC-backed Stablecoin Specification](https://d
 | `minBurnSize` | uint256 | Second element of `domain_config` storage word. Updated via owner-gated `set_min_burn_size`. | [`domain_config.rs`](crates/usdcx-faucet/src/domain_config.rs) - `set_min_burn_size` in [`burn_policy.rs`](crates/usdcx-faucet/src/burn_policy.rs) MASM |
 | `totalSupply` | uint256 (optional on-chain) | `FungibleFaucet` tracks `token_supply` natively. Incremented on mint, decremented on burn. Enforced: `token_supply <= max_supply`. | miden-standards `FungibleFaucet` `token_config` slot |
 
-### mint() Preconditions
+### mint() Preconditions (10/10 on-chain)
 
-| ID | Circle Precondition | Implementation | Code |
+All 10 Circle mint preconditions are verified on-chain in the MASM `check_policy` procedure.
+
+| ID | Circle Precondition | On-chain MASM check | Error |
 |---|---|---|---|
-| MINT-PRE-1 | ECDSA.recover(hash, sig) must resolve to address in `xReserveAttesters` | Compute `PK_COMM = Poseidon2(PK)`, look up in `attesters` map, call `ecdsa_k256_keccak::verify(PK_COMM, MSG)`. Uses PK_COMM-based lookup (equivalent security). | [`mint_policy.rs`](crates/usdcx-faucet/src/mint_policy.rs) - `check_policy` verifies ECDSA signature via `ecdsa_k256_keccak::verify` |
-| MINT-PRE-2 | `depositIntent.magic` must be `0x5a2e0acd` | Validated in `DepositIntent::validate()` (Rust-side). Will be validated in MASM when full attestation check is implemented. | [`deposit_intent.rs`](crates/usdcx-faucet/src/deposit_intent.rs#L43-L45) |
-| MINT-PRE-3 | `depositIntent.version` must be `1` | Validated in `DepositIntent::validate()`. | [`deposit_intent.rs`](crates/usdcx-faucet/src/deposit_intent.rs#L46-L48) |
-| MINT-PRE-4 | `depositIntent.amount` must be > 0 | Validated in `DepositIntent::validate()`. | [`deposit_intent.rs`](crates/usdcx-faucet/src/deposit_intent.rs#L49-L51) |
-| MINT-PRE-5 | `depositIntent.remoteDomain` must match contract's `domain` | Validated in `DepositIntent::validate()` against `expected_domain`. MASM reads `DOMAIN_CONFIG_SLOT[0]`. | [`deposit_intent.rs`](crates/usdcx-faucet/src/deposit_intent.rs#L52-L56) |
-| MINT-PRE-6 | `depositIntent.remoteToken` must match stablecoin contract | Validated in `DepositIntent::validate()` against `faucet_id`. MASM compares against `active_account::get_id`. | [`deposit_intent.rs`](crates/usdcx-faucet/src/deposit_intent.rs#L57-L59) |
-| MINT-PRE-7 | `localToken` and `localDepositor` must not be zero | Validated in `DepositIntent::validate()`. | [`deposit_intent.rs`](crates/usdcx-faucet/src/deposit_intent.rs#L60-L65) |
-| MINT-PRE-8 | `amount` must be at least `maxFee` | Validated in `DepositIntent::validate()`. | [`deposit_intent.rs`](crates/usdcx-faucet/src/deposit_intent.rs#L66-L68) |
-| MINT-PRE-9 | `maxFee` must be >= passed `feeAmount` | `check_policy` reads `fee_amount` and `max_fee` from the advice map attestation data, asserts `fee_amount <= max_fee` via `u32lte`. The `max_fee` is baked into the signed message `merge(NONCE, [amount, domain_id, max_fee, 0])`. | [`mint_policy.rs`](crates/usdcx-faucet/src/mint_policy.rs) - MASM `check_policy` step 7 |
-| MINT-PRE-10 | `usedNonces[nonce]` must be `false` | `NonceRegistry` storage map lookup. MASM reads `NONCES_SLOT` and asserts value is zero word. | [`nonce_registry.rs`](crates/usdcx-faucet/src/nonce_registry.rs) - `NONCES_SLOT` in MASM |
+| MINT-PRE-1 | ECDSA.recover must resolve to xReserveAttesters | `PK_COMM` lookup in `attesters` storage map + `ecdsa_k256_keccak::verify` | `ERR_ATTESTER_NOT_APPROVED` |
+| MINT-PRE-2 | `magic` must be `0x5a2e0acd` | `assert_eq.err=ERR_INVALID_MAGIC` | `ERR_INVALID_MAGIC` |
+| MINT-PRE-3 | `version` must be `1` | `assert_eq.err=ERR_INVALID_VERSION` | `ERR_INVALID_VERSION` |
+| MINT-PRE-4 | `amount` must be > 0 | `neq.0 assert.err=ERR_ZERO_AMOUNT` | `ERR_ZERO_AMOUNT` |
+| MINT-PRE-5 | `remoteDomain` must match contract's domain | Read `DOMAIN_CONFIG_SLOT`, `assert_eq.err=ERR_DOMAIN_MISMATCH` | `ERR_DOMAIN_MISMATCH` |
+| MINT-PRE-6 | `remoteToken` must match contract identifier | `active_account::get_id`, `assert_eq.err=ERR_TOKEN_MISMATCH` | `ERR_TOKEN_MISMATCH` |
+| MINT-PRE-7 | `localToken` and `localDepositor` must not be zero | Sum all 8 u32 limbs per address, `neq.0 assert` | `ERR_ZERO_LOCAL_TOKEN` / `ERR_ZERO_LOCAL_DEPOSITOR` |
+| MINT-PRE-8 | `amount` must be at least `maxFee` | `u32assert2 u32lte assert.err=ERR_AMOUNT_BELOW_MAX_FEE` | `ERR_AMOUNT_BELOW_MAX_FEE` |
+| MINT-PRE-9 | `maxFee` must be >= `feeAmount` | `u32assert2 u32lte assert.err=ERR_FEE_EXCEEDS_MAX_FEE` | `ERR_FEE_EXCEEDS_MAX_FEE` |
+| MINT-PRE-10 | `usedNonces[nonce]` must be false | `get_map_item` + `assertz.err=ERR_NONCE_ALREADY_USED` | `ERR_NONCE_ALREADY_USED` |
 
 ### mint() State Transitions
 
