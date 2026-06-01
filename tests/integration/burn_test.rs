@@ -9,6 +9,7 @@ use miden_standards::code_builder::CodeBuilder;
 use miden_protocol::crypto::rand::RandomCoin;
 use miden_testing::MockChain;
 use usdcx_faucet::burn_note::UsdcxBurnNote;
+use usdcx_faucet::deposit_intent::{bytes32_to_felts, felts_to_bytes32};
 
 use crate::helpers::*;
 
@@ -366,6 +367,145 @@ async fn burn_while_paused_fails() -> anyhow::Result<()> {
         err_str.contains("paused") || err_str.contains("assertion failed"),
         "expected pause-related error, got: {err_str}"
     );
+
+    Ok(())
+}
+
+// USDCX BURN NOTE STORAGE TESTS
+// ================================================================================================
+
+/// Verifies that UsdcxBurnNote stores destination_domain and destination_recipient
+/// in the note's public storage, and the values can be read back correctly.
+#[tokio::test]
+async fn burn_note_contains_destination_storage() -> anyhow::Result<()> {
+    let owner_id = test_owner_id();
+    let faucet = create_test_usdcx_faucet_existing(owner_id)?;
+    let faucet_id = faucet.id();
+
+    let amount: u64 = 10_000;
+    let destination_domain: u32 = 0; // Ethereum
+    let destination_recipient: [u8; 32] = [
+        0x74, 0x2d, 0x35, 0xCc, 0x66, 0x34, 0xC0, 0x53,
+        0x29, 0x25, 0xa3, 0xb8, 0x44, 0xBc, 0x9e, 0x75,
+        0x95, 0xf2, 0xbD, 0x1e, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+
+    let asset = Asset::Fungible(FungibleAsset::new(faucet_id, amount)?);
+    let seed = Word::new([
+        Felt::new_unchecked(900),
+        Felt::new_unchecked(901),
+        Felt::new_unchecked(902),
+        Felt::new_unchecked(903),
+    ]);
+    let mut rng = RandomCoin::new(seed);
+
+    let note = UsdcxBurnNote::create(
+        owner_id,
+        faucet_id,
+        asset,
+        destination_domain,
+        &destination_recipient,
+        &mut rng,
+    )?;
+
+    // Verify note is public
+    assert_eq!(note.metadata().note_type(), NoteType::Public);
+
+    // Verify storage has 9 items
+    let storage = note.recipient().storage();
+    assert_eq!(usize::from(storage.num_items()), UsdcxBurnNote::NUM_STORAGE_ITEMS);
+
+    // Verify destination_domain (first felt)
+    let stored_domain = storage.items()[0].as_canonical_u64() as u32;
+    assert_eq!(stored_domain, destination_domain);
+
+    // Verify destination_recipient (felts 1-8)
+    let stored_recipient_felts: [Felt; 8] = storage.items()[1..9].try_into().unwrap();
+    let stored_recipient = felts_to_bytes32(&stored_recipient_felts);
+    assert_eq!(stored_recipient, destination_recipient);
+
+    Ok(())
+}
+
+/// Verifies that burn notes with different destination domains are distinct.
+#[tokio::test]
+async fn burn_note_different_destinations() -> anyhow::Result<()> {
+    let owner_id = test_owner_id();
+    let faucet = create_test_usdcx_faucet_existing(owner_id)?;
+    let faucet_id = faucet.id();
+
+    let amount: u64 = 5_000;
+    let recipient = [0xABu8; 32];
+
+    let asset_eth = Asset::Fungible(FungibleAsset::new(faucet_id, amount)?);
+    let asset_arb = Asset::Fungible(FungibleAsset::new(faucet_id, amount)?);
+
+    let seed1 = Word::new([Felt::new_unchecked(1000), Felt::new_unchecked(1001), Felt::new_unchecked(1002), Felt::new_unchecked(1003)]);
+    let seed2 = Word::new([Felt::new_unchecked(2000), Felt::new_unchecked(2001), Felt::new_unchecked(2002), Felt::new_unchecked(2003)]);
+
+    let note_ethereum = UsdcxBurnNote::create(owner_id, faucet_id, asset_eth, 0, &recipient, &mut RandomCoin::new(seed1))?;
+    let note_arbitrum = UsdcxBurnNote::create(owner_id, faucet_id, asset_arb, 3, &recipient, &mut RandomCoin::new(seed2))?;
+
+    // Different domain IDs in storage
+    let eth_domain = note_ethereum.recipient().storage().items()[0].as_canonical_u64() as u32;
+    let arb_domain = note_arbitrum.recipient().storage().items()[0].as_canonical_u64() as u32;
+    assert_eq!(eth_domain, 0);
+    assert_eq!(arb_domain, 3);
+
+    // Same recipient in both
+    let eth_recipient_felts: [Felt; 8] = note_ethereum.recipient().storage().items()[1..9].try_into().unwrap();
+    let arb_recipient_felts: [Felt; 8] = note_arbitrum.recipient().storage().items()[1..9].try_into().unwrap();
+    assert_eq!(felts_to_bytes32(&eth_recipient_felts), recipient);
+    assert_eq!(felts_to_bytes32(&arb_recipient_felts), recipient);
+
+    Ok(())
+}
+
+/// Verifies that a burn note with real destination data can be consumed by the faucet.
+#[tokio::test]
+async fn burn_with_destination_storage_succeeds() -> anyhow::Result<()> {
+    let attester_sk = make_attester_keypair(42);
+    let pk_comm = attester_pk_comm(&attester_sk);
+    let owner_id = test_owner_id();
+    let faucet = create_test_usdcx_faucet_existing_with_attesters(owner_id, vec![pk_comm])?;
+
+    // Create burn note with specific destination
+    let destination_domain: u32 = 0;
+    let destination_recipient: [u8; 32] = [
+        0x74, 0x2d, 0x35, 0xCc, 0x66, 0x34, 0xC0, 0x53,
+        0x29, 0x25, 0xa3, 0xb8, 0x44, 0xBc, 0x9e, 0x75,
+        0x95, 0xf2, 0xbD, 0x1e, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+    let burn_amount: u64 = 5_000;
+    let asset = Asset::Fungible(FungibleAsset::new(faucet.id(), burn_amount)?);
+    let seed = Word::new([Felt::new_unchecked(800), Felt::new_unchecked(801), Felt::new_unchecked(802), Felt::new_unchecked(803)]);
+    let burn_note = UsdcxBurnNote::create(
+        owner_id, faucet.id(), asset, destination_domain, &destination_recipient, &mut RandomCoin::new(seed),
+    )?;
+
+    let mut builder = MockChain::builder();
+    builder.add_account(faucet.clone())?;
+    builder.add_output_note(RawOutputNote::Full(burn_note.clone()));
+    let mut mock_chain = builder.build()?;
+    mock_chain.prove_next_block()?;
+
+    // Step 1: Mint tokens to create supply
+    let nonce = Word::new([Felt::new_unchecked(50), Felt::new_unchecked(51), Felt::new_unchecked(52), Felt::new_unchecked(53)]);
+    mint_tokens(&mut mock_chain, &faucet, &attester_sk, 100_000, nonce).await?;
+
+    // Step 2: Burn with destination-bearing note
+    let sm = test_source_manager();
+    let burn_tx = mock_chain
+        .build_tx_context(faucet.id(), &[burn_note.id()], &[])?
+        .with_source_manager(sm)
+        .build()?;
+    let executed = burn_tx.execute().await?;
+
+    // Burn succeeded
+    mock_chain.add_pending_executed_transaction(&executed)?;
+    mock_chain.prove_next_block()?;
 
     Ok(())
 }
