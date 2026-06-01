@@ -31,8 +31,14 @@ pub enum DepositIntentError {
     #[error("amount is zero")]
     ZeroAmount,
 
-    #[error("amount {amount} is not greater than max_fee {max_fee}")]
+    #[error("amount {amount} is less than max_fee {max_fee}")]
     AmountBelowMaxFee { amount: u64, max_fee: u64 },
+
+    #[error("local_token is zero (all bytes are 0)")]
+    ZeroLocalToken,
+
+    #[error("local_depositor is zero (all bytes are 0)")]
+    ZeroLocalDepositor,
 }
 
 // DEPOSIT INTENT
@@ -41,15 +47,16 @@ pub enum DepositIntentError {
 /// A Circle CCTP deposit intent carried in the advice stack.
 ///
 /// Layout (Circle spec):
-/// - magic          : identifies this as a deposit intent
-/// - version        : protocol version
-/// - nonce          : 32-byte unique nonce
-/// - amount         : token amount (in smallest unit)
-/// - max_fee        : maximum fee the depositor accepts
-/// - remote_domain  : the Circle domain ID of the source chain
-/// - remote_token   : the AccountId of the token on the source chain
-/// - local_token    : 32-byte commitment identifying the local token
-/// - local_depositor: 32-byte address of the local depositor
+/// - magic            : identifies this as a deposit intent (0x5a2e0acd)
+/// - version          : protocol version (must be 1)
+/// - amount           : token amount (in smallest unit)
+/// - remote_domain    : target chain's Circle domain ID
+/// - remote_token     : faucet's AccountId on Miden
+/// - remote_recipient : 32-byte recipient address on Miden
+/// - local_token      : 32-byte source USDC contract on Ethereum
+/// - local_depositor  : 32-byte depositor address on Ethereum
+/// - max_fee          : maximum fee the depositor accepts
+/// - nonce            : 32-byte unique nonce for replay protection
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DepositIntent {
     pub magic: u32,
@@ -59,6 +66,7 @@ pub struct DepositIntent {
     pub max_fee: u64,
     pub remote_domain: u32,
     pub remote_token: AccountId,
+    pub remote_recipient: [u8; 32],
     pub local_token: [u8; 32],
     pub local_depositor: [u8; 32],
 }
@@ -75,6 +83,7 @@ impl DepositIntent {
         max_fee: u64,
         remote_domain: u32,
         remote_token: AccountId,
+        remote_recipient: [u8; 32],
         local_token: [u8; 32],
         local_depositor: [u8; 32],
     ) -> Self {
@@ -86,6 +95,7 @@ impl DepositIntent {
             max_fee,
             remote_domain,
             remote_token,
+            remote_recipient,
             local_token,
             local_depositor,
         }
@@ -102,7 +112,9 @@ impl DepositIntent {
     /// 3. `remote_domain` matches the chain's `expected_domain`
     /// 4. `remote_token` matches the `faucet_id`
     /// 5. `amount` is non-zero
-    /// 6. `amount` is greater than `max_fee`
+    /// 6. `amount` >= `max_fee` (Circle spec: amount must be at least max_fee)
+    /// 7. `local_token` is not zero
+    /// 8. `local_depositor` is not zero
     pub fn validate(
         &self,
         expected_domain: u32,
@@ -140,11 +152,19 @@ impl DepositIntent {
             return Err(DepositIntentError::ZeroAmount);
         }
 
-        if self.amount <= self.max_fee {
+        if self.amount < self.max_fee {
             return Err(DepositIntentError::AmountBelowMaxFee {
                 amount: self.amount,
                 max_fee: self.max_fee,
             });
+        }
+
+        if self.local_token == [0u8; 32] {
+            return Err(DepositIntentError::ZeroLocalToken);
+        }
+
+        if self.local_depositor == [0u8; 32] {
+            return Err(DepositIntentError::ZeroLocalDepositor);
         }
 
         Ok(())
@@ -156,17 +176,18 @@ impl DepositIntent {
     /// Serializes this intent to a `Vec<Felt>` suitable for pushing onto the Miden advice stack.
     ///
     /// Encoding (8 u32 felts per bytes32, AggLayer convention):
-    /// - [0]     : magic      (u32, fits in a felt)
-    /// - [1]     : version    (u32, fits in a felt)
-    /// - [2..9]  : nonce (32 bytes as 8 felts, one u32 per felt)
-    /// - [10]    : amount
-    /// - [11]    : max_fee
-    /// - [12]    : remote_domain (u32, fits in a felt)
-    /// - [13..14]: remote_token (2 Felts from AccountId)
-    /// - [15..22]: local_token (32 bytes as 8 felts, one u32 per felt)
-    /// - [23..30]: local_depositor (32 bytes as 8 felts, one u32 per felt)
+    /// - [0]      : magic      (u32, fits in a felt)
+    /// - [1]      : version    (u32, fits in a felt)
+    /// - [2..9]   : nonce (32 bytes as 8 felts, one u32 per felt)
+    /// - [10]     : amount
+    /// - [11]     : max_fee
+    /// - [12]     : remote_domain (u32, fits in a felt)
+    /// - [13..14] : remote_token (2 Felts from AccountId)
+    /// - [15..22] : remote_recipient (32 bytes as 8 felts, one u32 per felt)
+    /// - [23..30] : local_token (32 bytes as 8 felts, one u32 per felt)
+    /// - [31..38] : local_depositor (32 bytes as 8 felts, one u32 per felt)
     pub fn to_advice_felts(&self) -> Vec<Felt> {
-        let mut out = Vec::with_capacity(31);
+        let mut out = Vec::with_capacity(39);
 
         out.push(Felt::new_unchecked(self.magic as u64));
         out.push(Felt::new_unchecked(self.version as u64));
@@ -181,6 +202,7 @@ impl DepositIntent {
         out.push(id_felts[0]);
         out.push(id_felts[1]);
 
+        out.extend(bytes32_to_felts(&self.remote_recipient));
         out.extend(bytes32_to_felts(&self.local_token));
         out.extend(bytes32_to_felts(&self.local_depositor));
 
@@ -189,6 +211,17 @@ impl DepositIntent {
 
     // ACCESSORS
     // --------------------------------------------------------------------------------------------
+
+    /// Computes the Poseidon2 message hash over all critical depositIntent fields.
+    ///
+    /// This is the message that the attester signs. It covers:
+    /// magic, version, nonce(8), amount, max_fee, remote_domain,
+    /// remote_token(2), remote_recipient(8), local_token(8), local_depositor(8).
+    ///
+    /// Total: 39 felts hashed via `Hasher::hash_elements`.
+    pub fn message_hash(&self) -> Word {
+        Hasher::hash_elements(&self.to_advice_felts())
+    }
 
     /// Returns the nonce as a `Word` for use as a storage map key.
     ///

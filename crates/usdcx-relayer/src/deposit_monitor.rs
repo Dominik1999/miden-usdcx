@@ -7,6 +7,7 @@ use miden_protocol::{Felt, Hasher, Word, ZERO};
 use miden_standards::code_builder::CodeBuilder;
 use thiserror::Error;
 use tracing::{debug, info, warn};
+use usdcx_faucet::deposit_intent::DepositIntent;
 
 use crate::circle_api::{Attestation, CircleApi, CircleApiError};
 use crate::config::RelayerConfig;
@@ -102,22 +103,19 @@ impl<C: CircleApi> DepositMonitor<C> {
     /// `MintTransaction` contains everything needed to execute and prove the
     /// transaction once the faucet account state is available.
     ///
-    /// The transaction script and advice inputs follow the same pattern as the
-    /// integration tests: the tx script calls `create_fungible_asset` then
-    /// `mint_and_send`, while `check_policy` reads PK_COMM, NONCE, fee data,
-    /// and the ECDSA signature from the advice map.
+    /// The advice map carries the full depositIntent data (39 felts), PK_COMM,
+    /// fee_amount, NONCE_KEY, max_fee, MESSAGE, and the ECDSA signature.
     pub fn build_mint_transaction(
         &self,
         deposit: &DepositEvent,
         _attestation: &Attestation,
         pk_comm: Word,
-        nonce: Word,
+        intent: &DepositIntent,
         faucet_id_prefix: Felt,
         faucet_id_suffix: Felt,
         recipient: Word,
         prepared_signature: Vec<Felt>,
         fee_amount: u64,
-        max_fee: u64,
     ) -> Result<MintTransaction, DepositMonitorError> {
         info!(
             tx_hash = %deposit.tx_hash,
@@ -161,17 +159,40 @@ impl<C: CircleApi> DepositMonitor<C> {
 
         debug!("transaction script compiled successfully");
 
-        // 2. Build the advice map (real, same as integration tests)
-        let message = deposit_message(nonce, deposit.amount, self.config.domain_id, max_fee);
+        // 2. Build the advice map with full depositIntent data
+        let message = intent.message_hash();
+        let nonce_key = intent.nonce_key();
         let sig_key = Hasher::merge(&[pk_comm, message]);
 
+        // Advice map value layout (matches check_policy read order):
+        // [PK_COMM(4), DEPOSIT_INTENT(39) + pad(1), fee_amount word(4),
+        //  NONCE_KEY(4), max_fee word(4), MESSAGE(4)]
         let mut attestation_data: Vec<Felt> = Vec::new();
+
+        // PK_COMM (4 felts)
         attestation_data.extend(pk_comm.as_elements());
-        attestation_data.extend(nonce.as_elements());
+
+        // DEPOSIT_INTENT (39 felts) + 1 padding zero = 40 felts
+        attestation_data.extend(intent.to_advice_felts());
+        attestation_data.push(ZERO);
+
+        // fee_amount word [fee_amount, 0, 0, 0]
         attestation_data.push(Felt::new_unchecked(fee_amount));
-        attestation_data.push(Felt::new_unchecked(max_fee));
         attestation_data.push(ZERO);
         attestation_data.push(ZERO);
+        attestation_data.push(ZERO);
+
+        // NONCE_KEY (4 felts)
+        attestation_data.extend(nonce_key.as_elements());
+
+        // max_fee word [max_fee, 0, 0, 0]
+        attestation_data.push(Felt::new_unchecked(intent.max_fee));
+        attestation_data.push(ZERO);
+        attestation_data.push(ZERO);
+        attestation_data.push(ZERO);
+
+        // MESSAGE (4 felts)
+        attestation_data.extend(message.as_elements());
 
         let advice_inputs = AdviceInputs::default()
             .with_map([
@@ -183,17 +204,6 @@ impl<C: CircleApi> DepositMonitor<C> {
             script_len = tx_script_code.len(),
             "mint transaction built with real tx script and advice map"
         );
-
-        // 3. Return the prepared transaction
-        // To execute and prove, the caller needs the faucet account state from
-        // the Miden node. That's the remaining integration point:
-        //   let tx_context = miden_client
-        //       .build_tx_context(faucet_id, &[], &[])
-        //       .tx_script(compiled_script)
-        //       .extend_advice_inputs(advice_inputs)
-        //       .build()?;
-        //   let executed = tx_context.execute().await?;
-        //   let proven = tx_context.prove(executed)?;
 
         Ok(MintTransaction {
             tx_script_code,
@@ -246,22 +256,6 @@ impl<C: CircleApi> DepositMonitor<C> {
             tokio::time::sleep(interval).await;
         }
     }
-}
-
-// HELPERS
-// ================================================================================================
-
-/// Compute the deposit message: merge(NONCE, [amount, domain_id, max_fee, 0]).
-///
-/// This must match the MASM computation in check_policy.
-fn deposit_message(nonce: Word, amount: u64, domain_id: u32, max_fee: u64) -> Word {
-    let amount_word = Word::new([
-        Felt::new_unchecked(amount),
-        Felt::new_unchecked(domain_id as u64),
-        Felt::new_unchecked(max_fee),
-        ZERO,
-    ]);
-    Hasher::merge(&[nonce, amount_word])
 }
 
 // ERRORS

@@ -102,7 +102,8 @@ async fn mint_with_valid_attestation_succeeds() -> anyhow::Result<()> {
     ]);
 
     // Build advice inputs with the attestation signature
-    let advice = attestation_advice(&attester_sk, nonce, amount, TEST_DOMAIN_ID, 0, 0);
+    let intent = test_deposit_intent(faucet.id(), amount, 0, nonce);
+    let advice = attestation_advice(&attester_sk, &intent, 0);
 
     // Verify PK_COMM is in the faucet storage
     debug_assert_eq!(
@@ -167,7 +168,8 @@ async fn mint_with_unknown_attester_fails() -> anyhow::Result<()> {
     ]);
 
     // Sign with the unknown attester (not in registry)
-    let advice = attestation_advice(&unknown_sk, nonce, amount, TEST_DOMAIN_ID, 0, 0);
+    let intent = test_deposit_intent(faucet.id(), amount, 0, nonce);
+    let advice = attestation_advice(&unknown_sk, &intent, 0);
 
     let source_manager = Arc::new(DefaultSourceManager::default());
     let tx_script_code = create_mint_tx_script_code(
@@ -222,7 +224,8 @@ async fn mint_nonce_replay_fails() -> anyhow::Result<()> {
     ]);
 
     // First mint should succeed
-    let advice1 = attestation_advice(&attester_sk, nonce, amount, TEST_DOMAIN_ID, 0, 0);
+    let intent1 = test_deposit_intent(faucet.id(), amount, 0, nonce);
+    let advice1 = attestation_advice(&attester_sk, &intent1, 0);
     let source_manager = Arc::new(DefaultSourceManager::default());
     let tx_script_code = create_mint_tx_script_code(
         faucet.id().prefix().as_felt(),
@@ -247,7 +250,8 @@ async fn mint_nonce_replay_fails() -> anyhow::Result<()> {
     mock_chain.prove_next_block()?;
 
     // Second mint with the same nonce should fail
-    let advice2 = attestation_advice(&attester_sk, nonce, amount, TEST_DOMAIN_ID, 0, 0);
+    let intent2 = test_deposit_intent(faucet.id(), amount, 0, nonce);
+    let advice2 = attestation_advice(&attester_sk, &intent2, 0);
     let source_manager2 = Arc::new(DefaultSourceManager::default());
     let tx_script_code2 = create_mint_tx_script_code(
         faucet.id().prefix().as_felt(),
@@ -307,7 +311,8 @@ async fn mint_wrong_domain_fails() -> anyhow::Result<()> {
 
     // Sign with a WRONG domain_id (12345 instead of TEST_DOMAIN_ID=99999)
     let wrong_domain: u32 = 12345;
-    let advice = attestation_advice(&attester_sk, nonce, amount, wrong_domain, 0, 0);
+    let intent = test_deposit_intent_with_domain(faucet.id(), amount, 0, nonce, wrong_domain);
+    let advice = attestation_advice(&attester_sk, &intent, 0);
 
     let source_manager = Arc::new(DefaultSourceManager::default());
     let tx_script_code = create_mint_tx_script_code(
@@ -365,7 +370,8 @@ async fn mint_fee_exceeds_max_fee_fails() -> anyhow::Result<()> {
     // max_fee = 50, but fee_amount = 100 (exceeds max_fee)
     let max_fee: u64 = 50;
     let fee_amount: u64 = 100;
-    let advice = attestation_advice(&attester_sk, nonce, amount, TEST_DOMAIN_ID, max_fee, fee_amount);
+    let intent = test_deposit_intent(faucet.id(), amount, max_fee, nonce);
+    let advice = attestation_advice(&attester_sk, &intent, fee_amount);
 
     let source_manager = Arc::new(DefaultSourceManager::default());
     let tx_script_code = create_mint_tx_script_code(
@@ -436,7 +442,8 @@ async fn mint_while_paused_fails() -> anyhow::Result<()> {
         Felt::new_unchecked(4),
     ]);
 
-    let advice = attestation_advice(&attester_sk, nonce, amount, TEST_DOMAIN_ID, 0, 0);
+    let intent = test_deposit_intent(faucet.id(), amount, 0, nonce);
+    let advice = attestation_advice(&attester_sk, &intent, 0);
 
     let mint_source_manager = Arc::new(DefaultSourceManager::default());
     let tx_script_code = create_mint_tx_script_code(

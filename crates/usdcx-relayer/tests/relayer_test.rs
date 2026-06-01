@@ -5,7 +5,9 @@
 //! The tx script compilation and advice map construction are REAL - only the
 //! chain polling and account state fetch remain mocked.
 
+use miden_protocol::testing::account_id::AccountIdBuilder;
 use miden_protocol::{Felt, Word, ZERO};
+use usdcx_faucet::deposit_intent::DepositIntent;
 use usdcx_relayer::circle_api::{CircleApi, MockCircleApi};
 use usdcx_relayer::config::RelayerConfig;
 use usdcx_relayer::deposit_monitor::DepositMonitor;
@@ -64,6 +66,37 @@ fn sample_recipient() -> Word {
     ])
 }
 
+fn sample_faucet_id() -> miden_protocol::account::AccountId {
+    AccountIdBuilder::new().build_with_seed([42; 32])
+}
+
+fn sample_intent(amount: u64) -> DepositIntent {
+    let nonce = sample_nonce();
+    let mut nonce_bytes = [0u8; 32];
+    for i in 0..4 {
+        let val = nonce[i].as_canonical_u64() as u32;
+        nonce_bytes[i * 4..i * 4 + 4].copy_from_slice(&val.to_le_bytes());
+    }
+
+    let mut local_token = [0u8; 32];
+    local_token[0] = 0xAA;
+    let mut local_depositor = [0u8; 32];
+    local_depositor[0] = 0xBB;
+    let mut remote_recipient = [0u8; 32];
+    remote_recipient[0] = 0xCC;
+
+    DepositIntent::new(
+        nonce_bytes,
+        amount,
+        0, // max_fee
+        99999, // domain_id matching test_config
+        sample_faucet_id(),
+        remote_recipient,
+        local_token,
+        local_depositor,
+    )
+}
+
 // DEPOSIT PIPELINE TESTS
 // ================================================================================================
 
@@ -92,17 +125,17 @@ async fn deposit_attestation_fetch_and_tx_build() {
     assert!(!attestation.attestation.is_empty());
 
     // Build mint transaction with real tx script compilation and advice map
+    let intent = sample_intent(deposit.amount);
     let tx = monitor.build_mint_transaction(
         &deposit,
         &attestation,
         sample_pk_comm(),
-        sample_nonce(),
+        &intent,
         Felt::new_unchecked(0xABCD), // faucet prefix
         Felt::new_unchecked(0x1234), // faucet suffix
         sample_recipient(),
         vec![ZERO; 4], // mock prepared signature
         0,             // fee_amount
-        0,             // max_fee
     ).unwrap();
 
     // The tx script is real compiled MASM
@@ -124,16 +157,16 @@ async fn tx_script_compiles_with_various_amounts() {
             recipient: "0xrecipient".into(),
         };
 
+        let intent = sample_intent(amount);
         let tx = monitor.build_mint_transaction(
             &deposit,
             &attestation,
             sample_pk_comm(),
-            sample_nonce(),
+            &intent,
             Felt::new_unchecked(0xABCD),
             Felt::new_unchecked(0x1234),
             sample_recipient(),
             vec![ZERO; 4],
-            0,
             0,
         ).unwrap();
 
@@ -214,16 +247,16 @@ async fn deposit_to_withdrawal_full_pipeline() {
         .await
         .unwrap();
 
+    let intent = sample_intent(deposit.amount);
     let mint_tx = deposit_monitor.build_mint_transaction(
         &deposit,
         &attestation,
         sample_pk_comm(),
-        sample_nonce(),
+        &intent,
         Felt::new_unchecked(0xABCD),
         Felt::new_unchecked(0x1234),
         sample_recipient(),
         vec![ZERO; 4],
-        0,
         0,
     ).unwrap();
 

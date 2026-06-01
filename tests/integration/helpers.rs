@@ -27,6 +27,7 @@ use rand::SeedableRng;
 use rand::rngs::SmallRng;
 use rand_chacha::ChaCha20Rng;
 use usdcx_faucet::burn_policy::UsdcxBurnPolicy;
+use usdcx_faucet::deposit_intent::DepositIntent;
 use usdcx_faucet::domain_config::DomainConfig;
 use usdcx_faucet::mint_policy::UsdcxMintPolicy;
 use usdcx_faucet::attester_registry::AttesterRegistry;
@@ -69,17 +70,64 @@ pub fn attester_pk_comm(sk: &AuthSecretKey) -> Word {
     sk.public_key().to_commitment().into()
 }
 
-/// Computes the deposit message: merge(NONCE, [amount, domain_id, 0, 0]).
+/// Computes the deposit message hash: Poseidon2::hash_elements over all 39 depositIntent felts.
 ///
 /// This must match the MASM computation in check_policy exactly.
-pub fn deposit_message(nonce: Word, amount: u64, domain_id: u32, max_fee: u64) -> Word {
-    let amount_word = Word::new([
-        Felt::new_unchecked(amount),
-        Felt::new_unchecked(domain_id as u64),
-        Felt::new_unchecked(max_fee),
-        ZERO,
-    ]);
-    Hasher::merge(&[nonce, amount_word])
+pub fn deposit_message(intent: &DepositIntent) -> Word {
+    intent.message_hash()
+}
+
+/// Creates a test `DepositIntent` with sensible defaults.
+///
+/// The `nonce_bytes` are constructed from a `Word` by encoding each felt as a u32
+/// in the first 16 bytes (leaving the rest zeroed). This matches the common test
+/// pattern of using a Word as a nonce.
+pub fn test_deposit_intent(
+    faucet_id: AccountId,
+    amount: u64,
+    max_fee: u64,
+    nonce: Word,
+) -> DepositIntent {
+    // Convert Word nonce to bytes32 (first 4 felts as u32 LE in first 16 bytes)
+    let mut nonce_bytes = [0u8; 32];
+    for i in 0..4 {
+        let val = nonce[i].as_canonical_u64() as u32;
+        nonce_bytes[i * 4..i * 4 + 4].copy_from_slice(&val.to_le_bytes());
+    }
+
+    // Non-zero local_token and local_depositor (required by validation)
+    let mut local_token = [0u8; 32];
+    local_token[0] = 0xAA; // USDC contract on Ethereum (placeholder)
+
+    let mut local_depositor = [0u8; 32];
+    local_depositor[0] = 0xBB; // depositor on Ethereum (placeholder)
+
+    let mut remote_recipient = [0u8; 32];
+    remote_recipient[0] = 0xCC; // recipient on Miden (placeholder)
+
+    DepositIntent::new(
+        nonce_bytes,
+        amount,
+        max_fee,
+        TEST_DOMAIN_ID,
+        faucet_id,
+        remote_recipient,
+        local_token,
+        local_depositor,
+    )
+}
+
+/// Creates a test `DepositIntent` with a custom domain ID (for negative tests).
+pub fn test_deposit_intent_with_domain(
+    faucet_id: AccountId,
+    amount: u64,
+    max_fee: u64,
+    nonce: Word,
+    domain_id: u32,
+) -> DepositIntent {
+    let mut intent = test_deposit_intent(faucet_id, amount, max_fee, nonce);
+    intent.remote_domain = domain_id;
+    intent
 }
 
 /// The well-known advice map key for attestation data (PK_COMM + NONCE).
@@ -94,21 +142,25 @@ pub const ATTESTATION_DATA_KEY: Word = Word::new([
 /// Builds advice inputs for attestation verification in check_policy.
 ///
 /// The advice map carries:
-/// - `ATTESTATION_DATA_KEY` -> [PK_COMM(4), NONCE(4), fee_amount, max_fee, 0, 0]
+/// - `ATTESTATION_DATA_KEY` -> [PK_COMM(4), DEPOSIT_INTENT(39), fee_amount, 0, 0, 0,
+///                               NONCE_KEY(4), max_fee, 0, 0, 0, MESSAGE(4)]
 /// - `merge(PK_COMM, MESSAGE)` -> prepared ECDSA secp256k1 signature
 ///
-/// The `fee_amount` is what the relayer claims. The `max_fee` is baked into the
-/// signed message. check_policy asserts `fee_amount <= max_fee`.
+/// The check_policy reads from advice stack in this order:
+///   1. PK_COMM (4 felts)
+///   2. depositIntent fields in 10 word-sized chunks (40 felts, last padded with 0)
+///   3. fee_amount word [fee_amount, 0, 0, 0]
+///   4. NONCE_KEY word (Poseidon2 hash of nonce bytes32)
+///   5. max_fee word [max_fee, 0, 0, 0]
+///   6. MESSAGE word (Poseidon2 hash of all 39 intent felts)
 pub fn attestation_advice(
     attester_sk: &AuthSecretKey,
-    nonce: Word,
-    amount: u64,
-    domain_id: u32,
-    max_fee: u64,
+    intent: &DepositIntent,
     fee_amount: u64,
 ) -> AdviceInputs {
     let pk_comm = attester_pk_comm(attester_sk);
-    let message = deposit_message(nonce, amount, domain_id, max_fee);
+    let message = deposit_message(intent);
+    let nonce_key = intent.nonce_key();
 
     // Sign the message
     let sig = attester_sk.sign(message);
@@ -117,14 +169,35 @@ pub fn attestation_advice(
     // Compute the advice map key for the signature: merge(PK_COMM, MESSAGE)
     let sig_key = Hasher::merge(&[pk_comm, message]);
 
-    // Build the attestation data: [PK_COMM(4), NONCE(4), fee_amount, max_fee, 0, 0]
+    // Build the attestation data matching the check_policy read order:
+    // [PK_COMM(4), DEPOSIT_INTENT(39) padded to 40, fee_amount word(4),
+    //  NONCE_KEY(4), max_fee word(4), MESSAGE(4)]
     let mut attestation_data: Vec<Felt> = Vec::new();
+
+    // PK_COMM (4 felts)
     attestation_data.extend(pk_comm.as_elements());
-    attestation_data.extend(nonce.as_elements());
+
+    // DEPOSIT_INTENT (39 felts) + 1 padding zero = 40 felts (10 words)
+    attestation_data.extend(intent.to_advice_felts());
+    attestation_data.push(ZERO); // pad to 40
+
+    // fee_amount word [fee_amount, 0, 0, 0]
     attestation_data.push(Felt::new_unchecked(fee_amount));
-    attestation_data.push(Felt::new_unchecked(max_fee));
     attestation_data.push(ZERO);
     attestation_data.push(ZERO);
+    attestation_data.push(ZERO);
+
+    // NONCE_KEY (4 felts)
+    attestation_data.extend(nonce_key.as_elements());
+
+    // max_fee word [max_fee, 0, 0, 0]
+    attestation_data.push(Felt::new_unchecked(intent.max_fee));
+    attestation_data.push(ZERO);
+    attestation_data.push(ZERO);
+    attestation_data.push(ZERO);
+
+    // MESSAGE (4 felts)
+    attestation_data.extend(message.as_elements());
 
     AdviceInputs::default()
         .with_map([

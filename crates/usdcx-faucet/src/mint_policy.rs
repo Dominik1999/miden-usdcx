@@ -38,37 +38,69 @@ const USDCX_MINT_POLICY_MASM: &str = "
     const ATTESTER_ACTIVE=[1, 0, 0, 0]
 
     # Well-known advice map key for the attestation data.
-    # The relayer puts [PK_COMM(4), NONCE(4), fee_amount, max_fee, 0, 0]
+    # The relayer puts [PK_COMM(4), DEPOSIT_INTENT_FELTS(39), fee_amount, 0, 0, 0]
     # under this key in the advice map before building the transaction.
     const ATTESTATION_DATA_KEY=[3735928559, 3405691582, 3735928559, 3405691582]
+
+    # depositIntent field validation constants
+    const DEPOSIT_INTENT_MAGIC=0x5a2e0acd
+    const DEPOSIT_INTENT_VERSION=1
 
     const ERR_ATTESTER_NOT_APPROVED=\"attester public key commitment not in registry\"
     const ERR_NONCE_ALREADY_USED=\"deposit intent nonce has already been used\"
     const ERR_FEE_EXCEEDS_MAX_FEE=\"fee_amount exceeds max_fee from the signed deposit intent\"
+    const ERR_INVALID_MAGIC=\"depositIntent magic does not match expected value\"
+    const ERR_INVALID_VERSION=\"depositIntent version does not match expected value\"
+    const ERR_DOMAIN_MISMATCH=\"depositIntent remoteDomain does not match faucet domain config\"
+    const ERR_TOKEN_MISMATCH=\"depositIntent remoteToken does not match faucet account ID\"
+    const ERR_AMOUNT_BELOW_MAX_FEE=\"depositIntent amount is less than maxFee\"
 
     # PROCEDURES
     # ============================================================================================
 
     #! Mint policy check invoked via dynexec by the TokenPolicyManager.
     #!
-    #! Verifies an ECDSA secp256k1 attestation from the advice provider before
-    #! allowing the mint to proceed. The attestation data is read from the
-    #! advice stack (PK_COMM, NONCE) and the signature is read from the
-    #! advice map keyed by merge(PK_COMM, MESSAGE).
+    #! Verifies an ECDSA secp256k1 attestation over the full depositIntent
+    #! before allowing the mint to proceed.
+    #!
+    #! The advice map value (keyed by ATTESTATION_DATA_KEY) layout:
+    #!   [PK_COMM(4),
+    #!    magic, version, n0, n1,          # intent word 0
+    #!    n2, n3, n4, n5,                  # intent word 1
+    #!    n6, n7, amount, max_fee,         # intent word 2
+    #!    remote_domain, rt0, rt1, rr0,    # intent word 3
+    #!    rr1, rr2, rr3, rr4,             # intent word 4
+    #!    rr5, rr6, rr7, lt0,             # intent word 5
+    #!    lt1, lt2, lt3, lt4,             # intent word 6
+    #!    lt5, lt6, lt7, ld0,             # intent word 7
+    #!    ld1, ld2, ld3, ld4,             # intent word 8
+    #!    ld5, ld6, ld7, 0_pad,           # intent word 9 (39 felts + pad)
+    #!    fee_amount, 0, 0, 0,             # fee word
+    #!    NONCE_KEY(4),                    # Poseidon2(nonce bytes32)
+    #!    max_fee, 0, 0, 0,               # max_fee word (for fee validation)
+    #!    MESSAGE(4)]                      # Poseidon2(all 39 intent felts)
+    #!
+    #! On-chain validation:
+    #!   1. magic == 0x5a2e0acd
+    #!   2. version == 1
+    #!   3. remoteDomain matches faucet's domain config
+    #!   4. remoteToken matches faucet's account ID
+    #!   5. amount >= maxFee
+    #!   6. fee_amount <= maxFee
+    #!   7. nonce not already used (+ mark used)
+    #!   8. attester PK_COMM in registry
+    #!   9. ECDSA signature over MESSAGE
     #!
     #! Inputs:  [amount, tag, note_type, RECIPIENT]
     #! Outputs: [amount, tag, note_type, RECIPIENT]
     #!
-    #! Panics if:
-    #! - the attester PK_COMM is not in the approved attesters registry.
-    #! - the deposit nonce has already been used.
-    #! - the ECDSA secp256k1 signature verification fails.
+    #! Panics if any validation check fails.
     #!
     #! Invocation: dynexec
     pub proc check_policy
         # Stack: [amount, tag, note_type, RECIPIENT(4)]
 
-        # 1. Load attestation data (PK_COMM + NONCE) from advice map
+        # 1. Load attestation data from advice map
         push.ATTESTATION_DATA_KEY
         adv.push_mapval
         dropw
@@ -83,82 +115,123 @@ const USDCX_MINT_POLICY_MASM: &str = "
         push.ATTESTERS_SLOT[0..2]
         exec.active_account::get_map_item
         # => [VALUE(4), PK_COMM, amount, tag, note_type, RECIPIENT]
-        # get_map_item returns VALUE reversed on stack
-        # Stored [1,0,0,0] appears as [0,0,0,1]; check VALUE[3]
         movdn.3 drop drop drop
         # => [is_approved, PK_COMM, amount, tag, note_type, RECIPIENT]
         assert.err=ERR_ATTESTER_NOT_APPROVED
         # => [PK_COMM, amount, tag, note_type, RECIPIENT]
 
-        # 4. Read NONCE from the advice stack
-        padw adv_loadw
-        # => [NONCE(4), PK_COMM(4), amount, tag, note_type, RECIPIENT(4)]
+        # 4. Read and validate depositIntent fields, dropping each word after validation.
+        #    This keeps the stack depth manageable.
 
-        # 5. Check nonce has not been used
+        # 4a. Read [magic, version, nonce0, nonce1] - validate magic and version, drop
+        padw adv_loadw
+        # => [magic, version, n0, n1, PK_COMM(4), amount, tag, note_type, RECIPIENT(4)]
+        dup push.DEPOSIT_INTENT_MAGIC assert_eq.err=ERR_INVALID_MAGIC
+        dup.1 push.DEPOSIT_INTENT_VERSION assert_eq.err=ERR_INVALID_VERSION
+        dropw
+        # => [PK_COMM(4), amount, tag, note_type, RECIPIENT(4)]
+
+        # 4b. Read [n2, n3, n4, n5] - no validation needed, drop
+        padw adv_loadw dropw
+        # => [PK_COMM(4), amount, tag, note_type, RECIPIENT(4)]
+
+        # 4c. Read [n6, n7, di_amount, max_fee] - validate amount >= max_fee, drop
+        padw adv_loadw
+        # => [n6, n7, di_amount, max_fee, PK_COMM(4), amount, tag, note_type, RECIPIENT(4)]
+        dup.3 dup.3 u32assert2 u32lte
+        # => [max_fee <= di_amount, n6, n7, di_amount, max_fee, PK_COMM(4), ...]
+        assert.err=ERR_AMOUNT_BELOW_MAX_FEE
+        dropw
+        # => [PK_COMM(4), amount, tag, note_type, RECIPIENT(4)]
+
+        # 4d. Read [remote_domain, rt0, rt1, rr0] - validate domain and token, drop
+        padw adv_loadw
+        # => [remote_domain, rt0, rt1, rr0, PK_COMM(4), amount, tag, note_type, RECIPIENT(4)]
+
+        # Validate remoteDomain matches config
+        push.DOMAIN_CONFIG_SLOT[0..2]
+        exec.active_account::get_item
+        # => [CONFIG(4), remote_domain, rt0, rt1, rr0, PK_COMM(4), ...]
+        movdn.3 drop drop drop
+        # => [domain_id, remote_domain, rt0, rt1, rr0, PK_COMM(4), ...]
+        dup.1 assert_eq.err=ERR_DOMAIN_MISMATCH
+        # => [remote_domain, rt0, rt1, rr0, PK_COMM(4), ...]
+
+        # Validate remoteToken matches faucet account ID
+        exec.active_account::get_id
+        # => [faucet_suffix, faucet_prefix, remote_domain, rt0, rt1, rr0, PK_COMM(4), ...]
+        dup.4 assert_eq   # faucet_prefix == rt1
+        # => [faucet_suffix, remote_domain, rt0, rt1, rr0, PK_COMM(4), ...]
+        dup.2 assert_eq.err=ERR_TOKEN_MISMATCH  # faucet_suffix == rt0
+        # => [remote_domain, rt0, rt1, rr0, PK_COMM(4), ...]
+        dropw
+        # => [PK_COMM(4), amount, tag, note_type, RECIPIENT(4)]
+
+        # 4e-4i. Read remaining 6 words (remote_recipient, local_token, local_depositor)
+        #         No additional on-chain validation needed (non-zero checked off-chain).
+        #         Just consume them from the advice stack.
+        padw adv_loadw dropw   # rr1..rr4
+        padw adv_loadw dropw   # rr5, rr6, rr7, lt0
+        padw adv_loadw dropw   # lt1..lt4
+        padw adv_loadw dropw   # lt5, lt6, lt7, ld0
+        padw adv_loadw dropw   # ld1..ld4
+        padw adv_loadw dropw   # ld5, ld6, ld7, pad
+        # => [PK_COMM(4), amount, tag, note_type, RECIPIENT(4)]
+
+        # 5. Read fee_amount from advice stack: [fee_amount, 0, 0, 0]
+        padw adv_loadw
+        # => [fee_amount, 0, 0, 0, PK_COMM(4), amount, tag, note_type, RECIPIENT(4)]
+        movdn.3 drop drop drop
+        # => [fee_amount, PK_COMM(4), amount, tag, note_type, RECIPIENT(4)]
+
+        # 6. Read NONCE_KEY from advice stack
+        padw adv_loadw
+        # => [NONCE_KEY(4), fee_amount, PK_COMM(4), amount, tag, note_type, RECIPIENT(4)]
+
+        # 7. Check nonce has not been used
         dupw
         push.NONCES_SLOT[0..2]
         exec.active_account::get_map_item
-        # => [NONCE_VAL(4), NONCE, PK_COMM, amount, tag, note_type, RECIPIENT]
-        # Nonce val stored as [1,0,0,0] appears reversed; check VALUE[3]
+        # => [NONCE_VAL(4), NONCE_KEY, fee_amount, PK_COMM, amount, tag, note_type, RECIPIENT]
         movdn.3 drop drop drop
-        # => [nonce_val_last, NONCE, PK_COMM, amount, tag, note_type, RECIPIENT]
+        # => [nonce_val_last, NONCE_KEY, fee_amount, PK_COMM, amount, tag, note_type, RECIPIENT]
         assertz.err=ERR_NONCE_ALREADY_USED
-        # => [NONCE, PK_COMM, amount, tag, note_type, RECIPIENT]
+        # => [NONCE_KEY, fee_amount, PK_COMM, amount, tag, note_type, RECIPIENT]
 
-        # 6. Mark nonce as used in storage
+        # 8. Mark nonce as used in storage
         dupw
         push.NONCE_USED swapw
         push.NONCES_SLOT[0..2]
         exec.native_account::set_map_item
         dropw
-        # => [NONCE, PK_COMM, amount, tag, note_type, RECIPIENT]
+        # => [NONCE_KEY, fee_amount, PK_COMM, amount, tag, note_type, RECIPIENT]
+        dropw
+        # => [fee_amount, PK_COMM(4), amount, tag, note_type, RECIPIENT(4)]
 
-        # 7. Read fee data from advice stack: [fee_amount, max_fee, 0, 0]
+        # 9. Read max_fee from advice stack for fee validation: [max_fee, 0, 0, 0]
         padw adv_loadw
-        # => [fee_amount, max_fee, 0, 0, NONCE, PK_COMM, amount, tag, note_type, RECIPIENT]
-
-        # Assert fee_amount <= max_fee (MINT-PRE-9)
-        # u32lte checks: second <= top. With [fee_amount, max_fee] after swap
-        # we get [max_fee, fee_amount], and u32lte checks fee_amount <= max_fee.
-        dup.1 dup.1 swap u32assert2 u32lte
-        assert.err=ERR_FEE_EXCEEDS_MAX_FEE
-        # => [fee_amount, max_fee, 0, 0, NONCE, PK_COMM, amount, tag, note_type, RECIPIENT]
-
-        # Drop fee_amount and padding, keep max_fee
-        # Stack: [fee_amount, max_fee, 0, 0, NONCE, PK_COMM, amount, tag, note_type, RECIPIENT]
-        drop swap drop swap drop
-        # => [max_fee, NONCE, PK_COMM, amount, tag, note_type, RECIPIENT]
-
-        # 8. Compute MESSAGE = merge(NONCE, [amount, domain_id, max_fee, 0])
-        #
-        # Read domain_id from config
-        push.DOMAIN_CONFIG_SLOT[0..2]
-        exec.active_account::get_item
-        # => [CONFIG_WORD(4), max_fee, NONCE, PK_COMM, amount, tag, note_type, RECIPIENT]
-        # CONFIG_WORD reversed on stack: stored [domain_id, min_burn, 0, 0]
-        # appears as [0, 0, min_burn, domain_id] on stack
+        # => [max_fee, 0, 0, 0, fee_amount, PK_COMM(4), amount, tag, note_type, RECIPIENT(4)]
         movdn.3 drop drop drop
-        # => [domain_id, max_fee, NONCE(4), PK_COMM(4), amount, tag, note_type, RECIPIENT(4)]
-        #     pos 0      pos 1    pos 2-5   pos 6-9    pos 10  pos 11 pos 12   pos 13-16
+        # => [max_fee, fee_amount, PK_COMM(4), amount, tag, note_type, RECIPIENT(4)]
 
-        # Build AMOUNT_WORD = [amount, domain_id, max_fee, 0] for the message hash.
-        # Stack: [domain_id, max_fee, NONCE(4), PK_COMM(4), amount, tag, note_type, RECIPIENT(4)]
-        #         pos 0      pos 1    pos 2-5   pos 6-9    pos 10
-        #
-        # Strategy: dup amount from pos 10, push 0, then use movup.3 x3 to
-        # reorder [0, amount, domain_id, max_fee, ...] into [amount, domain_id, max_fee, 0, ...]
-        # The original domain_id (pos 0) and max_fee (pos 1) get absorbed into
-        # the AMOUNT_WORD via the movup.3 operations, leaving NONCE cleanly below.
-        dup.10 push.0 movup.3 movup.3 movup.3
-        # => [amount, domain_id, max_fee, 0, NONCE(4), PK_COMM(4), amount, tag, note_type, RECIPIENT(4)]
+        # Assert fee_amount <= max_fee
+        # Stack: [max_fee, fee_amount, PK_COMM(4), ...]
+        # We need u32lte to check fee_amount <= max_fee.
+        # u32lte pops b (top), a (next), checks a <= b.
+        # So we need [max_fee, fee_amount] on top -> checks fee_amount <= max_fee.
+        dup.1 dup.1 u32assert2 u32lte
+        assert.err=ERR_FEE_EXCEEDS_MAX_FEE
+        # => [max_fee, fee_amount, PK_COMM(4), amount, tag, note_type, RECIPIENT(4)]
+        drop drop
+        # => [PK_COMM(4), amount, tag, note_type, RECIPIENT(4)]
 
-        swapw
-        exec.poseidon2::merge
+        # 10. Read MESSAGE from advice stack (Poseidon2 hash of all 39 intent felts)
+        padw adv_loadw
         # => [MESSAGE(4), PK_COMM(4), amount, tag, note_type, RECIPIENT(4)]
 
-        # 9. Verify ECDSA secp256k1 signature (following x402 pattern)
+        # 11. Verify ECDSA secp256k1 signature
         swapw
-        # => [PK_COMM, MESSAGE, amount, tag, note_type, RECIPIENT]
+        # => [PK_COMM(4), MESSAGE(4), amount, tag, note_type, RECIPIENT(4)]
 
         dupw.1 dupw.1
         exec.poseidon2::merge
@@ -172,24 +245,31 @@ const USDCX_MINT_POLICY_MASM: &str = "
         # => [amount, tag, note_type, RECIPIENT]
     end
 
-    #! Mint tokens after verifying an attestation (called from a tx script).
+    #! Cross-chain reserve mint: verifies attestation and mints with fee splitting.
     #!
-    #! Verifies the Falcon512 attestation, then mints (amount - fee_amount) to the
+    #! This is the procedure the relayer's tx script calls to perform the full
+    #! Circle CCTP mint flow. It verifies the ECDSA secp256k1 attestation over
+    #! the depositIntent message hash, then mints (amount - fee_amount) to the
     #! recipient and fee_amount to the relayer (if fee > 0), producing up to two
     #! output notes.
     #!
+    #! The message hash is Poseidon2::hash_elements over all 39 depositIntent felts.
+    #! This is precomputed by the relayer and read from the advice stack.
+    #!
     #! Inputs:  [recipient_suffix, recipient_prefix, relayer_suffix, relayer_prefix,
-    #!           fee_amount, amount, tag, note_type, NONCE, PK_COMM]
+    #!           fee_amount, amount, tag, note_type, NONCE_KEY, PK_COMM]
     #! Outputs: []
+    #!
+    #! NONCE_KEY is the Poseidon2 hash of the 8 nonce felts (bytes32_to_key).
     #!
     #! Panics if:
     #! - the attester PK_COMM is not in the approved attesters registry.
     #! - the deposit nonce has already been used.
-    #! - the Falcon512 signature verification fails.
+    #! - the ECDSA secp256k1 signature verification fails.
     #!
     #! Invocation: exec
     #!
-    #! Local memory layout (16 felts):
+    #! Local memory layout (20 felts):
     #!   0: recipient_suffix
     #!   1: recipient_prefix
     #!   2: relayer_suffix
@@ -198,40 +278,41 @@ const USDCX_MINT_POLICY_MASM: &str = "
     #!   5: amount (total)
     #!   6: tag
     #!   7: note_type
-    #!   8-11: NONCE (word)
+    #!   8-11: NONCE_KEY (word)
     #!   12-15: PK_COMM (word)
-    @locals(16)
-    pub proc mint_with_attestation
+    #!   16-19: MESSAGE (word, read from advice stack)
+    @locals(20)
+    pub proc xreserve_mint
         # Stack: [recipient_suffix, recipient_prefix, relayer_suffix, relayer_prefix,
-        #         fee_amount, amount, tag, note_type, NONCE(4), PK_COMM(4)]
+        #         fee_amount, amount, tag, note_type, NONCE_KEY(4), PK_COMM(4)]
 
         # ---- Save all inputs to locals ----
 
         # Save recipient_suffix and recipient_prefix
         loc_store.0
         # => [recipient_prefix, relayer_suffix, relayer_prefix, fee_amount, amount,
-        #     tag, note_type, NONCE(4), PK_COMM(4)]
+        #     tag, note_type, NONCE_KEY(4), PK_COMM(4)]
         loc_store.1
         # => [relayer_suffix, relayer_prefix, fee_amount, amount,
-        #     tag, note_type, NONCE(4), PK_COMM(4)]
+        #     tag, note_type, NONCE_KEY(4), PK_COMM(4)]
 
         # Save relayer_suffix and relayer_prefix
         loc_store.2
-        # => [relayer_prefix, fee_amount, amount, tag, note_type, NONCE(4), PK_COMM(4)]
+        # => [relayer_prefix, fee_amount, amount, tag, note_type, NONCE_KEY(4), PK_COMM(4)]
         loc_store.3
-        # => [fee_amount, amount, tag, note_type, NONCE(4), PK_COMM(4)]
+        # => [fee_amount, amount, tag, note_type, NONCE_KEY(4), PK_COMM(4)]
 
         # Save fee_amount, amount, tag, note_type
         loc_store.4
-        # => [amount, tag, note_type, NONCE(4), PK_COMM(4)]
+        # => [amount, tag, note_type, NONCE_KEY(4), PK_COMM(4)]
         loc_store.5
-        # => [tag, note_type, NONCE(4), PK_COMM(4)]
+        # => [tag, note_type, NONCE_KEY(4), PK_COMM(4)]
         loc_store.6
-        # => [note_type, NONCE(4), PK_COMM(4)]
+        # => [note_type, NONCE_KEY(4), PK_COMM(4)]
         loc_store.7
-        # => [NONCE(4), PK_COMM(4)]
+        # => [NONCE_KEY(4), PK_COMM(4)]
 
-        # Save NONCE word to locals 8-11
+        # Save NONCE_KEY word to locals 8-11
         loc_storew_le.8 dropw
         # => [PK_COMM(4)]
 
@@ -240,7 +321,7 @@ const USDCX_MINT_POLICY_MASM: &str = "
         # => []
 
         # ===========================================================================
-        # ATTESTATION VERIFICATION (mirrors check_policy steps 3-8)
+        # ATTESTATION VERIFICATION
         # ===========================================================================
 
         # 1. Verify the attester PK_COMM is in the approved registry
@@ -260,15 +341,15 @@ const USDCX_MINT_POLICY_MASM: &str = "
 
         # 2. Check nonce has not been used
         padw loc_loadw_le.8
-        # => [NONCE(4)]
+        # => [NONCE_KEY(4)]
         dupw
         push.NONCES_SLOT[0..2]
         exec.active_account::get_map_item
-        # => [NONCE_VAL(4), NONCE(4)]
+        # => [NONCE_VAL(4), NONCE_KEY(4)]
         movdn.3 drop drop drop
-        # => [nonce_val_last, NONCE(4)]
+        # => [nonce_val_last, NONCE_KEY(4)]
         assertz.err=ERR_NONCE_ALREADY_USED
-        # => [NONCE(4)]
+        # => [NONCE_KEY(4)]
 
         # 3. Mark nonce as used in storage
         dupw
@@ -276,29 +357,26 @@ const USDCX_MINT_POLICY_MASM: &str = "
         push.NONCES_SLOT[0..2]
         exec.native_account::set_map_item
         dropw
-        # => [NONCE(4)]
+        # => [NONCE_KEY(4)]
+        dropw
+        # => []
 
-        # 4. Compute MESSAGE = merge(NONCE, [amount, domain_id, 0, 0])
-        push.DOMAIN_CONFIG_SLOT[0..2]
-        exec.active_account::get_item
-        # => [CONFIG_WORD(4), NONCE(4)]
-        # CONFIG_WORD reversed on stack: stored [domain_id, min_burn, 0, 0]
-        # appears as [0, 0, min_burn, domain_id]
-        movdn.3 drop drop drop
-        # => [domain_id, NONCE(4)]
-
-        # Build AMOUNT_WORD = [amount, domain_id, 0, 0]
-        loc_load.5 swap push.0 push.0
-        movup.3 movup.3 swap
-        # => [amount, domain_id, 0, 0, NONCE(4)]
-
-        swapw
-        exec.poseidon2::merge
+        # 4. Read MESSAGE from advice stack (Poseidon2 hash of all 39 intent felts)
+        padw adv_loadw
         # => [MESSAGE(4)]
 
-        # 5. Verify Falcon512 signature
-        # Need PK_COMM and MESSAGE on stack for verify
+        # Save MESSAGE to locals 16-19
+        loc_storew_le.16 dropw
+        # => []
+
+        # 5. Verify ECDSA secp256k1 signature
         padw loc_loadw_le.12
+        # => [PK_COMM(4)]
+
+        padw loc_loadw_le.16
+        # => [MESSAGE(4), PK_COMM(4)]
+
+        swapw
         # => [PK_COMM(4), MESSAGE(4)]
 
         dupw.1 dupw.1
@@ -332,10 +410,7 @@ const USDCX_MINT_POLICY_MASM: &str = "
         dropw
         # => [ASSET_KEY(4), ASSET_VALUE(4)]
 
-        # Create recipient output note: need [tag, note_type, RECIPIENT(4)]
-        # RECIPIENT is a word built from (recipient_suffix, recipient_prefix)
-        # For a standard recipient, the RECIPIENT word is passed as a 4-felt word.
-        # Here we only have suffix+prefix (account ID), so we build a minimal
+        # Create recipient output note
         # RECIPIENT = [recipient_suffix, recipient_prefix, 0, 0]
         loc_load.6 loc_load.7
         # => [note_type, tag, ASSET_KEY(4), ASSET_VALUE(4)]
@@ -343,7 +418,6 @@ const USDCX_MINT_POLICY_MASM: &str = "
         # => [0, 0, recipient_prefix, recipient_suffix, note_type, tag,
         #     ASSET_KEY(4), ASSET_VALUE(4)]
 
-        # Arrange for output_note::create: [tag, note_type, RECIPIENT(4)]
         movup.5 movup.5
         # => [tag, note_type, 0, 0, recipient_prefix, recipient_suffix,
         #     ASSET_KEY(4), ASSET_VALUE(4)]
@@ -500,8 +574,8 @@ static CHECK_POLICY_ROOT: LazyLock<AccountProcedureRoot> = LazyLock::new(|| {
         .unwrap_or_else(|| panic!("component should contain procedure '{}'", full_path))
 });
 
-static MINT_WITH_ATTESTATION_ROOT: LazyLock<AccountProcedureRoot> = LazyLock::new(|| {
-    let full_path = format!("{}::mint_with_attestation", USDCX_MINT_POLICY_NAME);
+static XRESERVE_MINT_ROOT: LazyLock<AccountProcedureRoot> = LazyLock::new(|| {
+    let full_path = format!("{}::xreserve_mint", USDCX_MINT_POLICY_NAME);
     USDCX_MINT_POLICY_CODE
         .get_procedure_root_by_path(full_path.as_str())
         .unwrap_or_else(|| panic!("component should contain procedure '{}'", full_path))
@@ -567,9 +641,9 @@ impl UsdcxMintPolicy {
         *CHECK_POLICY_ROOT
     }
 
-    /// Returns the procedure root for `mint_with_attestation`.
-    pub fn mint_with_attestation_root() -> AccountProcedureRoot {
-        *MINT_WITH_ATTESTATION_ROOT
+    /// Returns the procedure root for `xreserve_mint`.
+    pub fn xreserve_mint_root() -> AccountProcedureRoot {
+        *XRESERVE_MINT_ROOT
     }
 
     /// Returns the procedure root for `add_attester`.
