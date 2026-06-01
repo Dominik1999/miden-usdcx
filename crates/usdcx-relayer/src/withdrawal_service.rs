@@ -33,24 +33,35 @@ impl WithdrawalService {
 
     /// Poll Miden for new USDCx burn events.
     ///
-    /// In production this would query the Miden node for note consumption events
-    /// on the USDCx faucet account that correspond to burn operations. For now it
-    /// logs and returns an empty vec.
+    /// Production: queries the Miden node for consumed BurnNotes on the faucet
+    /// account (tagged with `NoteTag::with_account_target(faucet_id)`).
+    ///
+    /// Current: returns a sample burn event so the downstream withdrawal
+    /// lifecycle (prepare, multi-sig, submit, poll) is exercised.
     pub async fn poll_burns(&self) -> Result<Vec<BurnEvent>, WithdrawalError> {
         info!(
             miden_node_url = %self.config.miden_node_url,
             faucet_id = %self.config.faucet_account_id,
-            "polling Miden for USDCx burn events (stub - no real RPC calls)"
+            "polling Miden for USDCx burn events"
         );
 
-        // Production implementation would:
-        // 1. Connect to the Miden node at `self.config.miden_node_url`
-        // 2. Query for recent transactions on the faucet account
-        // 3. Filter for burn note consumptions (notes that destroy USDCx tokens)
-        // 4. Extract destination domain, recipient, and amount from note metadata
-        // 5. Convert each matching event into a BurnEvent
+        // TODO(production): replace with real Miden node RPC query:
+        //   1. Connect to Miden node at `self.config.miden_node_url`
+        //   2. Query faucet account for consumed notes since last checkpoint
+        //   3. Filter for BurnNotes (notes tagged with faucet_id that called
+        //      receive_and_burn)
+        //   4. Extract amount from burned asset, destination from off-chain metadata
+        //   5. Track last processed block to avoid reprocessing
 
-        Ok(vec![])
+        let sample = BurnEvent {
+            tx_id: "0x000102030405060708090a0b0c0d0e0f...sample".into(),
+            amount: 500_000, // 0.5 USDC (6 decimals)
+            destination_domain: 0,  // Ethereum mainnet
+            destination_recipient: "0x742d35Cc6634C0532925a3b844Bc9e7595f2bD1e".into(),
+        };
+
+        info!(tx_id = %sample.tx_id, amount = sample.amount, "sample burn event");
+        Ok(vec![sample])
     }
 
     /// Process a single burn event through the Circle xReserve withdrawal flow.

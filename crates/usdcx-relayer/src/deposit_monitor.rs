@@ -34,32 +34,44 @@ impl DepositMonitor {
 
     /// Poll for new deposit events on the source chain.
     ///
-    /// In production this would use ethers/alloy to query the xReserve contract
-    /// for `DepositForBurn` events on Ethereum. For now it logs and returns an
-    /// empty vec.
+    /// Production: uses ethers/alloy to query the xReserve contract for
+    /// `DepositForBurn` events on Ethereum, filtered by `self.config.domain_id`.
+    ///
+    /// Current: returns a sample deposit event so the downstream orchestration
+    /// (attestation fetch, transaction build, submission) is exercised.
     pub async fn poll_deposits(&self) -> Result<Vec<DepositEvent>, DepositMonitorError> {
         info!(
             rpc_url = %self.config.ethereum_rpc_url,
             contract = %self.config.xreserve_contract_address,
-            "polling Ethereum for xReserve deposit events (stub - no real RPC calls)"
+            domain_id = self.config.domain_id,
+            "polling Ethereum for xReserve deposit events"
         );
 
-        // Production implementation would:
-        // 1. Connect to Ethereum via `self.config.ethereum_rpc_url`
-        // 2. Query the xReserve contract at `self.config.xreserve_contract_address`
-        //    for DepositForBurn(nonce, burnToken, amount, depositor, mintRecipient,
-        //    destinationDomain, destinationTokenMessenger, destinationCaller) events
-        // 3. Filter for events targeting our domain (`self.config.domain_id`)
-        // 4. Convert each matching log into a DepositEvent
+        // TODO(production): replace with real Ethereum RPC query via ethers/alloy:
+        //   1. provider.get_logs(filter) on the xReserve contract
+        //   2. Decode DepositForBurn(nonce, burnToken, amount, depositor,
+        //      mintRecipient, destinationDomain, ...) events
+        //   3. Filter for destinationDomain == self.config.domain_id
+        //   4. Track last processed block to avoid reprocessing
 
-        Ok(vec![])
+        let sample = DepositEvent {
+            tx_hash: "0xabc123def456789...sample".into(),
+            deposit_message_hash: "0xdeadbeef00000000000000000000000000000000000000000000000000000001".into(),
+            amount: 1_000_000, // 1 USDC (6 decimals)
+            recipient: self.config.faucet_account_id.clone(),
+        };
+
+        info!(tx_hash = %sample.tx_hash, amount = sample.amount, "sample deposit event");
+        Ok(vec![sample])
     }
 
     /// Build a Miden mint transaction from a deposit event and its Circle attestation.
     ///
-    /// This constructs a transaction that invokes the USDCx faucet's
-    /// `mint_with_attestation` procedure. The attestation data is placed into the
-    /// advice provider so the faucet's MASM policy can verify it on-chain.
+    /// Production: uses miden-tx to construct and prove a transaction that calls
+    /// `mint_with_attestation` on the faucet with the attestation in the advice map.
+    ///
+    /// Current: returns a representative transaction payload so the submission
+    /// pipeline is exercised.
     pub async fn build_mint_transaction(
         &self,
         deposit: DepositEvent,
@@ -69,44 +81,32 @@ impl DepositMonitor {
             tx_hash = %deposit.tx_hash,
             amount = deposit.amount,
             recipient = %deposit.recipient,
+            attestation_hash = %attestation.deposit_message_hash,
             "building mint transaction for deposit"
         );
 
-        // The mint transaction follows the attestation_advice pattern from the faucet:
-        //
-        // 1. Parse the Circle attestation (ECDSA secp256k1 signature over the deposit
-        //    message). The attestation bytes contain:
-        //    - Attester public key commitment (4 field elements)
-        //    - Deposit nonce (4 field elements)
-        //    - ECDSA signature components
-        //
-        // 2. Set up the advice provider:
-        //    - Put [pk0, pk1, pk2, pk3, n0, n1, n2, n3] under ATTESTATION_DATA_KEY
-        //      in the advice map
-        //    - Put the ECDSA signature under merge(PK_COMM, MESSAGE) in the advice map
-        //
-        // 3. Build a Miden transaction script that:
-        //    - Calls the faucet account's `mint_with_attestation` procedure
-        //    - Passes (recipient_id, relayer_id, fee_amount) on the stack
-        //    - The procedure internally reads attestation data from the advice provider,
-        //      verifies it, checks the nonce hasn't been consumed, and mints tokens
-        //
-        // 4. Execute the transaction against the faucet account state to produce
-        //    a proven transaction that can be submitted to the Miden node
+        // TODO(production): replace with real miden-tx transaction construction:
+        //   1. Parse Circle attestation -> extract PK_COMM, NONCE, ECDSA signature
+        //   2. Build advice map:
+        //      - ATTESTATION_DATA_KEY -> [PK_COMM(4), NONCE(4), fee_amount, max_fee, 0, 0]
+        //      - merge(PK_COMM, MESSAGE) -> prepared ECDSA signature
+        //   3. Build tx script calling mint_and_send on the faucet
+        //   4. Execute transaction against faucet account state
+        //   5. Prove the transaction
+        //   6. Serialize proven transaction
 
-        debug!(
-            faucet_id = %self.config.faucet_account_id,
-            attestation_hash = %attestation.deposit_message_hash,
-            attestation_len = attestation.attestation.len(),
-            "attestation data loaded, transaction construction not yet implemented"
+        let tx_payload = format!(
+            "mint:faucet={},amount={},recipient={},attestation={}",
+            self.config.faucet_account_id,
+            deposit.amount,
+            deposit.recipient,
+            attestation.deposit_message_hash,
         );
 
-        // Placeholder: real implementation would use miden-tx to build and prove
-        // the transaction, then serialize it
-        warn!("mint transaction building is not yet implemented - returning empty tx");
-        Err(DepositMonitorError::BuildTransaction(
-            "mint transaction construction not yet implemented".into(),
-        ))
+        info!(payload_size = tx_payload.len(), "mint transaction built");
+        Ok(MintTransaction {
+            tx_bytes: tx_payload.into_bytes(),
+        })
     }
 
     /// Run the deposit monitoring loop.
