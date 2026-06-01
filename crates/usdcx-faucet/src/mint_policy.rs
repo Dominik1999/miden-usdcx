@@ -54,6 +54,9 @@ const USDCX_MINT_POLICY_MASM: &str = "
     const ERR_DOMAIN_MISMATCH=\"depositIntent remoteDomain does not match faucet domain config\"
     const ERR_TOKEN_MISMATCH=\"depositIntent remoteToken does not match faucet account ID\"
     const ERR_AMOUNT_BELOW_MAX_FEE=\"depositIntent amount is less than maxFee\"
+    const ERR_ZERO_AMOUNT=\"depositIntent amount must be greater than zero\"
+    const ERR_ZERO_LOCAL_TOKEN=\"depositIntent localToken must not be zero\"
+    const ERR_ZERO_LOCAL_DEPOSITOR=\"depositIntent localDepositor must not be zero\"
 
     # PROCEDURES
     # ============================================================================================
@@ -135,9 +138,15 @@ const USDCX_MINT_POLICY_MASM: &str = "
         padw adv_loadw dropw
         # => [PK_COMM(4), amount, tag, note_type, RECIPIENT(4)]
 
-        # 4c. Read [n6, n7, di_amount, max_fee] - validate amount >= max_fee, drop
+        # 4c. Read [n6, n7, di_amount, max_fee] - validate amount > 0 and amount >= max_fee, drop
         padw adv_loadw
         # => [n6, n7, di_amount, max_fee, PK_COMM(4), amount, tag, note_type, RECIPIENT(4)]
+
+        # MINT-PRE-4: amount must be greater than zero
+        dup.2 neq.0 assert.err=ERR_ZERO_AMOUNT
+        # => [n6, n7, di_amount, max_fee, PK_COMM(4), ...]
+
+        # MINT-PRE-8: amount must be at least maxFee
         dup.3 dup.3 u32assert2 u32lte
         # => [max_fee <= di_amount, n6, n7, di_amount, max_fee, PK_COMM(4), ...]
         assert.err=ERR_AMOUNT_BELOW_MAX_FEE
@@ -167,15 +176,56 @@ const USDCX_MINT_POLICY_MASM: &str = "
         dropw
         # => [PK_COMM(4), amount, tag, note_type, RECIPIENT(4)]
 
-        # 4e-4i. Read remaining 6 words (remote_recipient, local_token, local_depositor)
-        #         No additional on-chain validation needed (non-zero checked off-chain).
-        #         Just consume them from the advice stack.
-        padw adv_loadw dropw   # rr1..rr4
-        padw adv_loadw dropw   # rr5, rr6, rr7, lt0
-        padw adv_loadw dropw   # lt1..lt4
-        padw adv_loadw dropw   # lt5, lt6, lt7, ld0
-        padw adv_loadw dropw   # ld1..ld4
-        padw adv_loadw dropw   # ld5, ld6, ld7, pad
+        # 4e. Read [rr1, rr2, rr3, rr4] - remote_recipient continued, drop
+        padw adv_loadw dropw
+        # => [PK_COMM(4), amount, tag, note_type, RECIPIENT(4)]
+
+        # 4f. Read [rr5, rr6, rr7, lt0] - end of remote_recipient, start localToken
+        padw adv_loadw
+        # => [rr5, rr6, rr7, lt0, PK_COMM(4), ...]
+        # Keep lt0 (bottom of word), drop rr5-rr7
+        drop drop drop
+        # => [lt0, PK_COMM(4), ...]
+
+        # 4g. Read [lt1, lt2, lt3, lt4]
+        padw adv_loadw
+        # => [lt1, lt2, lt3, lt4, lt0, PK_COMM(4), ...]
+        # OR all 5 localToken felts so far: lt0 | lt1 | lt2 | lt3 | lt4
+        movup.4 add add add add
+        # => [lt_acc, PK_COMM(4), ...]
+
+        # 4h. Read [lt5, lt6, lt7, ld0]
+        padw adv_loadw
+        # => [lt5, lt6, lt7, ld0, lt_acc, PK_COMM(4), ...]
+        # Finish localToken: lt_acc | lt5 | lt6 | lt7
+        movup.4 dup.1 add dup.2 add dup.3 add
+        # => [lt_final, lt5, lt6, lt7, ld0, PK_COMM(4), ...]
+        # MINT-PRE-7: localToken must not be zero
+        neq.0 assert.err=ERR_ZERO_LOCAL_TOKEN
+        # => [lt5, lt6, lt7, ld0, PK_COMM(4), ...]
+        # Stack: [lt5, lt6, lt7, ld0, PK_COMM(4), ...]
+        # Keep ld0 (position 3), drop lt5-lt7 (positions 0-2)
+        drop drop drop
+        # => [ld0, PK_COMM(4), ...]
+
+        # 4i. Read [ld1, ld2, ld3, ld4]
+        padw adv_loadw
+        # => [ld1, ld2, ld3, ld4, ld0, PK_COMM(4), ...]
+        # OR first 5: ld0 | ld1 | ld2 | ld3 | ld4
+        movup.4 add add add add
+        # => [ld_acc, PK_COMM(4), ...]
+
+        # 4j. Read [ld5, ld6, ld7, pad]
+        padw adv_loadw
+        # => [ld5, ld6, ld7, pad, ld_acc, PK_COMM(4), ...]
+        # Drop pad (position 3), keep ld5-ld7
+        movup.3 drop
+        # => [ld5, ld6, ld7, ld_acc, PK_COMM(4), ...]
+        # Finish localDepositor: ld_acc + ld5 + ld6 + ld7
+        add add add
+        # => [ld_final, PK_COMM(4), ...]
+        # MINT-PRE-7: localDepositor must not be zero
+        neq.0 assert.err=ERR_ZERO_LOCAL_DEPOSITOR
         # => [PK_COMM(4), amount, tag, note_type, RECIPIENT(4)]
 
         # 5. Read fee_amount from advice stack: [fee_amount, 0, 0, 0]
