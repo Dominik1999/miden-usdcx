@@ -293,22 +293,24 @@ Intentional adaptations to Miden's architecture. Each should be flagged to Circl
 | Transfer restrictions | Not in Circle's base spec | Blocklist on send+receive via `BasicBlocklist` | Added for OFAC/sanctions compliance. Not required by Circle but expected by regulators. |
 | Pausability | Not in Circle's base spec | `Pausable` component halts all operations | Added for operational safety. Common in regulated stablecoin contracts. |
 
-### bytes32 Encoding (Goldilocks Field Safety)
+### bytes32 Encoding (8 u32 Felts)
 
-Circle's spec uses `bytes32` for nonces, token addresses, and depositor addresses. Miden's field element (`Felt`) uses the Goldilocks prime (p = 2^64 - 2^32 + 1), which means naively packing 8 raw bytes into a u64 Felt can silently overflow mod p and corrupt the data.
+Circle's spec uses `bytes32` for nonces, token addresses, and depositor addresses. Miden's field element (`Felt`) uses the Goldilocks prime (p = 2^64 - 2^32 + 1), so raw 8-byte packing can silently overflow.
 
-We follow the [AggLayer's `build_felt` pattern](https://github.com/0xMiden/protocol/blob/next/crates/miden-agglayer/asm/agglayer/common/eth_address.masm#L82-L114): 32 bytes are split into 8 little-endian u32 limbs, then paired into 4 felts via `(hi * 2^32) + lo`. Each packed value is validated against the Goldilocks prime to ensure no silent reduction occurs.
+We follow the [AggLayer convention](https://github.com/0xMiden/protocol/blob/next/crates/miden-agglayer/asm/agglayer/bridge/bridge_in.masm): **one u32 per felt, 8 felts per bytes32**. No packing, no overflow possible.
 
 ```rust
-use usdcx_faucet::deposit_intent::{bytes32_to_word, word_to_bytes32};
+use usdcx_faucet::deposit_intent::{bytes32_to_felts, felts_to_bytes32, bytes32_to_key};
 
 let nonce_bytes: [u8; 32] = /* from Circle deposit intent */;
-let nonce_word = bytes32_to_word(&nonce_bytes);   // safe: panics if any felt would overflow
-let recovered = word_to_bytes32(nonce_word);       // roundtrip back to bytes
+let felts = bytes32_to_felts(&nonce_bytes);     // 8 felts, one u32 each (always safe)
+let recovered = felts_to_bytes32(&felts);        // roundtrip back to bytes
 assert_eq!(nonce_bytes, recovered);
+
+let key = bytes32_to_key(&nonce_bytes);          // Poseidon2 hash -> Word (for storage map keys)
 ```
 
-This encoding applies to the `nonce`, `local_token`, and `local_depositor` fields in [`DepositIntent`](crates/usdcx-faucet/src/deposit_intent.rs). Scalar values (`amount`, `max_fee`, `domain_id`) are small enough to fit safely in a single Felt without packing.
+For on-chain use (storage map keys, message hashing), the 8 felts are hashed down to a Word (4 felts) via Poseidon2. This applies to the `nonce`, `local_token`, and `local_depositor` fields in [`DepositIntent`](crates/usdcx-faucet/src/deposit_intent.rs). Scalar values (`amount`, `max_fee`, `domain_id`) fit in a single Felt.
 
 ### Additional Miden Capabilities (Beyond Circle Spec)
 
@@ -361,11 +363,11 @@ cargo test --workspace         # Run all 34 tests
 
 ## Test Results
 
-All 34 tests passing (4 unit + 23 faucet integration + 7 relayer integration).
+All 36 tests passing (6 unit + 23 faucet integration + 7 relayer integration).
 
 | Category | Tests | Status |
 |---|---|---|
-| **Unit (bytes32 encoding)** | `bytes32_roundtrip`, `bytes32_zero`, `bytes32_max_safe_value`, `bytes32_overflow_panics` | 4/4 pass |
+| **Unit (bytes32 encoding)** | `bytes32_roundtrip`, `bytes32_zero`, `bytes32_max_u32`, `bytes32_individual_limbs`, `bytes32_key_deterministic`, `bytes32_previously_overflowing_now_works` | 6/6 pass |
 | **Faucet creation** | `faucet_creation_succeeds`, `faucet_has_correct_domain_config`, `faucet_has_initial_attester` | 3/3 pass |
 | **Mint (attestation)** | `mint_with_valid_attestation_succeeds`, `mint_with_unknown_attester_fails`, `mint_nonce_replay_fails`, `mint_wrong_domain_fails`, `mint_while_paused_fails`, `mint_zero_amount_fails`, `mint_fee_exceeds_max_fee_fails` | 7/7 pass |
 | **Burn** | `burn_above_min_succeeds`, `burn_below_min_fails`, `burn_min_size_update_enforced`, `burn_while_paused_fails` | 4/4 pass |
@@ -384,7 +386,7 @@ All 34 tests passing (4 unit + 23 faucet integration + 7 relayer integration).
 - Pause/unpause cycle tested across mint and burn flows
 - Off-chain relayer with trait-based `CircleApi` (real HTTP client + `MockCircleApi` for testing)
 - Relayer `build_mint_transaction` compiles real MASM tx scripts and constructs real advice maps (attestation data + ECDSA signature entries matching the on-chain `check_policy` layout)
-- Safe `bytes32_to_word` encoding with Goldilocks field overflow detection
+- Safe `bytes32_to_felts` encoding (8 u32 felts per bytes32, AggLayer convention) with `bytes32_to_key` for Poseidon2 hashing to Word
 
 ## Next Steps
 

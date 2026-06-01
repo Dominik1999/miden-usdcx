@@ -4077,12 +4077,15 @@ dependencies = [
 name = "usdcx-relayer"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "miden-protocol",
+ "miden-standards",
  "reqwest",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
  "usdcx-faucet",
 ]
 
