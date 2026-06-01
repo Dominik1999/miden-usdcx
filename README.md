@@ -346,26 +346,32 @@ miden-usdcx/
       mint_test.rs              # Mint flow tests (ECDSA attestation verification)
       burn_test.rs              # Burn flow tests (minBurnSize enforcement)
       blocklist_test.rs         # Blocklist enforcement tests
+  crates/
+    usdcx-relayer/
+      tests/
+        relayer_test.rs         # Relayer orchestration tests (MockCircleApi)
 ```
 
 ## Building
 
 ```bash
 cargo check --workspace        # Type check
-cargo test -p usdcx-faucet --test integration   # Run integration tests
+cargo test --workspace         # Run all 34 tests
 ```
 
 ## Test Results
 
-All 23 integration tests passing. All core flows verified via MockChain.
+All 34 tests passing (4 unit + 23 faucet integration + 7 relayer integration).
 
 | Category | Tests | Status |
 |---|---|---|
+| **Unit (bytes32 encoding)** | `bytes32_roundtrip`, `bytes32_zero`, `bytes32_max_safe_value`, `bytes32_overflow_panics` | 4/4 pass |
 | **Faucet creation** | `faucet_creation_succeeds`, `faucet_has_correct_domain_config`, `faucet_has_initial_attester` | 3/3 pass |
 | **Mint (attestation)** | `mint_with_valid_attestation_succeeds`, `mint_with_unknown_attester_fails`, `mint_nonce_replay_fails`, `mint_wrong_domain_fails`, `mint_while_paused_fails`, `mint_zero_amount_fails`, `mint_fee_exceeds_max_fee_fails` | 7/7 pass |
 | **Burn** | `burn_above_min_succeeds`, `burn_below_min_fails`, `burn_min_size_update_enforced`, `burn_while_paused_fails` | 4/4 pass |
 | **Admin** | `owner_can_add_attester`, `owner_can_remove_attester`, `owner_can_set_min_burn_size`, `non_owner_cannot_add_attester`, `pause_unpause_cycle`, `ownership_transfer_two_step` | 6/6 pass |
 | **Blocklist** | `blocked_account_transfer_rejected`, `unblocked_account_transfer_succeeds`, `non_owner_blocklist_fails` | 3/3 pass |
+| **Relayer** | `deposit_poll_returns_sample_event`, `deposit_attestation_fetch_and_tx_build`, `tx_script_compiles_with_various_amounts`, `withdrawal_poll_returns_sample_event`, `withdrawal_full_lifecycle`, `withdrawal_rejects_insufficient_signers`, `deposit_to_withdrawal_full_pipeline` | 7/7 pass |
 
 ## Current Status
 
@@ -376,14 +382,17 @@ All 23 integration tests passing. All core flows verified via MockChain.
 - Blocklist enforcement tested end-to-end (block, unblock, non-owner rejection)
 - Two-step ownership transfer tested (nominate + accept)
 - Pause/unpause cycle tested across mint and burn flows
-- Off-chain relayer implemented with real Circle xReserve API calls (deposit monitoring, withdrawal lifecycle)
+- Off-chain relayer with trait-based `CircleApi` (real HTTP client + `MockCircleApi` for testing)
+- Relayer `build_mint_transaction` compiles real MASM tx scripts and constructs real advice maps (attestation data + ECDSA signature entries matching the on-chain `check_policy` layout)
+- Safe `bytes32_to_word` encoding with Goldilocks field overflow detection
 
 ## Next Steps
 
 1. Wire `mint_with_attestation` into integration tests (fee-split flow with two output notes)
-2. Add `max_fee` field to the attestation message format for fee limit enforcement
-3. Circle domain ID assignment for Miden
-4. End-to-end testnet deployment
+2. Connect relayer to real Ethereum RPC (ethers/alloy) for deposit event polling
+3. Connect relayer to Miden node RPC for account state fetch and transaction proving
+4. Circle domain ID assignment for Miden
+5. End-to-end testnet deployment
 
 ## Design Spec
 
