@@ -1,5 +1,5 @@
 use miden_protocol::account::AccountId;
-use miden_protocol::{Felt, Word, ZERO};
+use miden_protocol::{Felt, Hasher, Word, ZERO};
 use thiserror::Error;
 
 // CONSTANTS
@@ -7,9 +7,6 @@ use thiserror::Error;
 
 pub const DEPOSIT_INTENT_MAGIC: u32 = 0x5a2e_0acd;
 pub const DEPOSIT_INTENT_VERSION: u32 = 1;
-
-/// The Goldilocks prime: p = 2^64 - 2^32 + 1.
-const GOLDILOCKS_PRIME: u128 = (1u128 << 64) - (1u128 << 32) + 1;
 
 // ERRORS
 // ================================================================================================
@@ -158,24 +155,23 @@ impl DepositIntent {
 
     /// Serializes this intent to a `Vec<Felt>` suitable for pushing onto the Miden advice stack.
     ///
-    /// Encoding:
-    /// - [0]    : magic      (u32, fits in a felt)
-    /// - [1]    : version    (u32, fits in a felt)
-    /// - [2..5] : nonce (32 bytes as 4 felts via u32-limb packing)
-    /// - [6]    : amount
-    /// - [7]    : max_fee
-    /// - [8]    : remote_domain (u32, fits in a felt)
-    /// - [9..10]: remote_token (2 Felts from AccountId)
-    /// - [11..14]: local_token (32 bytes as 4 felts via u32-limb packing)
-    /// - [15..18]: local_depositor (32 bytes as 4 felts via u32-limb packing)
+    /// Encoding (8 u32 felts per bytes32, AggLayer convention):
+    /// - [0]     : magic      (u32, fits in a felt)
+    /// - [1]     : version    (u32, fits in a felt)
+    /// - [2..9]  : nonce (32 bytes as 8 felts, one u32 per felt)
+    /// - [10]    : amount
+    /// - [11]    : max_fee
+    /// - [12]    : remote_domain (u32, fits in a felt)
+    /// - [13..14]: remote_token (2 Felts from AccountId)
+    /// - [15..22]: local_token (32 bytes as 8 felts, one u32 per felt)
+    /// - [23..30]: local_depositor (32 bytes as 8 felts, one u32 per felt)
     pub fn to_advice_felts(&self) -> Vec<Felt> {
-        let mut out = Vec::with_capacity(19);
+        let mut out = Vec::with_capacity(31);
 
         out.push(Felt::new_unchecked(self.magic as u64));
         out.push(Felt::new_unchecked(self.version as u64));
 
-        let nonce_word = bytes32_to_word(&self.nonce);
-        out.extend(nonce_word.as_elements());
+        out.extend(bytes32_to_felts(&self.nonce));
 
         out.push(Felt::new_unchecked(self.amount));
         out.push(Felt::new_unchecked(self.max_fee));
@@ -185,11 +181,8 @@ impl DepositIntent {
         out.push(id_felts[0]);
         out.push(id_felts[1]);
 
-        let local_token_word = bytes32_to_word(&self.local_token);
-        out.extend(local_token_word.as_elements());
-
-        let local_depositor_word = bytes32_to_word(&self.local_depositor);
-        out.extend(local_depositor_word.as_elements());
+        out.extend(bytes32_to_felts(&self.local_token));
+        out.extend(bytes32_to_felts(&self.local_depositor));
 
         out
     }
@@ -197,65 +190,49 @@ impl DepositIntent {
     // ACCESSORS
     // --------------------------------------------------------------------------------------------
 
-    /// Returns the nonce as a `Word` using safe u32-limb packing.
+    /// Returns the nonce as a `Word` for use as a storage map key.
     ///
-    /// 32 bytes are split into 8 u32 limbs (little-endian), then paired into
-    /// 4 felts via `(hi * 2^32) + lo`. This matches the AggLayer's `build_felt`
-    /// pattern and avoids silent mod-p reduction in the Goldilocks field.
-    pub fn nonce_word(&self) -> Word {
-        bytes32_to_word(&self.nonce)
+    /// The 32-byte nonce is first expanded to 8 u32 felts (AggLayer convention),
+    /// then hashed via Poseidon2 to produce a single Word (4 felts) suitable
+    /// for storage map lookups and message hash computation.
+    pub fn nonce_key(&self) -> Word {
+        bytes32_to_key(&self.nonce)
     }
 }
 
-// BYTES32 <-> WORD ENCODING
+// BYTES32 <-> FELTS ENCODING
 // ================================================================================================
 
-/// Packs two u32 limbs into a single Felt: `felt = (hi * 2^32) + lo`.
+/// Converts a 32-byte array into 8 felts, one u32 per felt (little-endian).
 ///
-/// Panics if the packed value would reduce mod the Goldilocks prime
-/// (p = 2^64 - 2^32 + 1), which would silently corrupt the data.
-///
-/// This matches the AggLayer's `build_felt` procedure in MASM.
-fn build_felt(lo: u32, hi: u32) -> Felt {
-    let value = (hi as u64) * (1u64 << 32) + (lo as u64);
-    assert!(
-        (value as u128) < GOLDILOCKS_PRIME,
-        "u32 limbs ({lo:#010x}, {hi:#010x}) pack to {value} which overflows the Goldilocks field"
-    );
-    Felt::new_unchecked(value)
-}
-
-/// Converts a 32-byte array into a `Word` (4 felts) using safe u32-limb packing.
-///
-/// The 32 bytes are split into 8 little-endian u32 limbs, then paired into
-/// 4 felts: `felt[i] = (limb[2i+1] * 2^32) + limb[2i]`.
-///
-/// This encoding is field-safe: each felt is guaranteed to be less than the
-/// Goldilocks prime, so no silent mod-p reduction can occur.
-pub fn bytes32_to_word(bytes: &[u8; 32]) -> Word {
-    let mut felts = [ZERO; 4];
-    for i in 0..4 {
-        let lo = u32::from_le_bytes(bytes[i * 8..i * 8 + 4].try_into().unwrap());
-        let hi = u32::from_le_bytes(bytes[i * 8 + 4..i * 8 + 8].try_into().unwrap());
-        felts[i] = build_felt(lo, hi);
+/// This is the standard Miden convention for bytes32: each 4-byte chunk
+/// becomes one u32 value stored in a felt. No packing, no Goldilocks
+/// overflow possible.
+pub fn bytes32_to_felts(bytes: &[u8; 32]) -> [Felt; 8] {
+    let mut felts = [ZERO; 8];
+    for i in 0..8 {
+        let limb = u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
+        felts[i] = Felt::new_unchecked(limb as u64);
     }
-    Word::new(felts)
+    felts
 }
 
-/// Converts a `Word` back into a 32-byte array (inverse of `bytes32_to_word`).
-///
-/// Each felt is split into two u32 limbs via `u32split` semantics:
-/// `lo = felt % 2^32`, `hi = felt / 2^32`.
-pub fn word_to_bytes32(word: Word) -> [u8; 32] {
+/// Converts 8 felts back into a 32-byte array (inverse of `bytes32_to_felts`).
+pub fn felts_to_bytes32(felts: &[Felt; 8]) -> [u8; 32] {
     let mut bytes = [0u8; 32];
-    for i in 0..4 {
-        let value = word[i].as_canonical_u64();
-        let lo = (value & 0xFFFF_FFFF) as u32;
-        let hi = (value >> 32) as u32;
-        bytes[i * 8..i * 8 + 4].copy_from_slice(&lo.to_le_bytes());
-        bytes[i * 8 + 4..i * 8 + 8].copy_from_slice(&hi.to_le_bytes());
+    for i in 0..8 {
+        let limb = felts[i].as_canonical_u64() as u32;
+        bytes[i * 4..i * 4 + 4].copy_from_slice(&limb.to_le_bytes());
     }
     bytes
+}
+
+/// Hashes a bytes32 (8 felts) into a Word for use as a storage map key.
+///
+/// Uses Poseidon2 hash to compress 8 felts into 4 felts (1 Word).
+pub fn bytes32_to_key(bytes: &[u8; 32]) -> Word {
+    let felts = bytes32_to_felts(bytes);
+    Hasher::hash_elements(&felts)
 }
 
 #[cfg(test)]
@@ -263,46 +240,78 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bytes32_roundtrip() {
+    fn bytes32_felts_roundtrip() {
         let original: [u8; 32] = [
             0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
             0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
             0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28,
             0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38,
         ];
-        let word = bytes32_to_word(&original);
-        let recovered = word_to_bytes32(word);
+        let felts = bytes32_to_felts(&original);
+        let recovered = felts_to_bytes32(&felts);
         assert_eq!(original, recovered);
     }
 
     #[test]
-    fn bytes32_zero() {
+    fn bytes32_felts_zero() {
         let zero = [0u8; 32];
-        let word = bytes32_to_word(&zero);
-        assert_eq!(word, Word::new([ZERO; 4]));
-        assert_eq!(word_to_bytes32(word), zero);
+        let felts = bytes32_to_felts(&zero);
+        assert_eq!(felts, [ZERO; 8]);
+        assert_eq!(felts_to_bytes32(&felts), zero);
     }
 
     #[test]
-    fn bytes32_max_safe_value() {
-        // Max u32 limbs that DON'T overflow: hi=0xFFFFFFFF, lo=0x00000000
-        // packed = 0xFFFFFFFF_00000000 = 18446744069414584320 < p
-        let mut bytes = [0u8; 32];
-        // Set hi limb of first felt to 0xFFFFFFFF, lo to 0x00000000
-        bytes[4..8].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
-        let word = bytes32_to_word(&bytes);
-        let recovered = word_to_bytes32(word);
+    fn bytes32_felts_max_u32() {
+        // Every byte 0xFF: each u32 limb is 0xFFFFFFFF, which fits in a felt.
+        let bytes = [0xFF; 32];
+        let felts = bytes32_to_felts(&bytes);
+        for felt in &felts {
+            assert_eq!(felt.as_canonical_u64(), 0xFFFF_FFFF);
+        }
+        let recovered = felts_to_bytes32(&felts);
         assert_eq!(bytes, recovered);
     }
 
     #[test]
-    #[should_panic(expected = "overflows the Goldilocks field")]
-    fn bytes32_overflow_panics() {
-        // hi=0xFFFFFFFF, lo=0x00000001 -> packed = p = 2^64 - 2^32 + 1 -> wraps to 0
+    fn bytes32_felts_individual_limbs() {
+        // Verify each 4-byte chunk maps to the correct felt.
         let mut bytes = [0u8; 32];
-        bytes[0..4].copy_from_slice(&0x0000_0001u32.to_le_bytes()); // lo = 1
-        bytes[4..8].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // hi = 0xFFFFFFFF
-        let _ = bytes32_to_word(&bytes); // should panic
+        for i in 0..8 {
+            let val = (i as u32 + 1) * 0x1111_1111;
+            bytes[i * 4..i * 4 + 4].copy_from_slice(&val.to_le_bytes());
+        }
+        let felts = bytes32_to_felts(&bytes);
+        for i in 0..8 {
+            let expected = (i as u64 + 1) * 0x1111_1111;
+            assert_eq!(felts[i].as_canonical_u64(), expected);
+        }
+    }
+
+    #[test]
+    fn bytes32_to_key_deterministic() {
+        let bytes: [u8; 32] = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+            0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+            0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28,
+            0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38,
+        ];
+        let key1 = bytes32_to_key(&bytes);
+        let key2 = bytes32_to_key(&bytes);
+        assert_eq!(key1, key2);
+    }
+
+    #[test]
+    fn bytes32_previously_overflowing_now_works() {
+        // hi=0xFFFFFFFF, lo=0x00000001 would have overflowed with packed encoding.
+        // With 8 u32 felts, every u32 fits trivially.
+        let mut bytes = [0u8; 32];
+        bytes[0..4].copy_from_slice(&0x0000_0001u32.to_le_bytes());
+        bytes[4..8].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        let felts = bytes32_to_felts(&bytes);
+        assert_eq!(felts[0].as_canonical_u64(), 1);
+        assert_eq!(felts[1].as_canonical_u64(), 0xFFFF_FFFF);
+        let recovered = felts_to_bytes32(&felts);
+        assert_eq!(bytes, recovered);
     }
 }
 
