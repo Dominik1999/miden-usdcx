@@ -99,9 +99,9 @@ Stack on exit: `[amount, tag, note_type, RECIPIENT]` (unchanged - passed back to
 | Note | Type | Tag | Direction | Purpose |
 |---|---|---|---|---|
 | Mint output (P2ID) | Private or Public | `NoteTag::with_account_target(recipient_id)` | Faucet -> Alice | Delivers minted USDCx to recipient |
-| Burn (BurnNote) | Always Public | `NoteTag::with_account_target(faucet_id)` | Alice -> Faucet | Redeems USDCx for USDC withdrawal |
+| Burn (UsdcxBurnNote) | Always Public | `NoteTag::with_account_target(faucet_id)` | Alice -> Faucet | Redeems USDCx for USDC withdrawal |
 
-The mint output is a standard P2ID note - it uses the same note type as all Miden token transfers. There is nothing USDCx-specific about the output note; the attestation verification happens entirely within the faucet's mint policy before the note is created. The BurnNote is always public to provide an on-chain audit trail for withdrawals.
+The mint output is a standard P2ID note - it uses the same note type as all Miden token transfers. There is nothing USDCx-specific about the output note; the attestation verification happens entirely within the faucet's mint policy before the note is created. The `UsdcxBurnNote` is always public and stores `[destination_domain, destination_recipient(8)]` in its storage so the withdrawal service knows where to release USDC.
 
 ### What gets verified (Circle spec compliance)
 
@@ -122,21 +122,26 @@ Step-by-step walkthrough of the USDCx burn flow, from a user redeeming tokens to
 
 ### Off-chain: User creates a burn note
 
-**Step 1 - User creates a BurnNote.** The user holds USDCx tokens in their account vault. To redeem them for USDC, they create a BurnNote - a public note containing the tokens to destroy, addressed to the faucet.
+**Step 1 - User creates a UsdcxBurnNote.** The user holds USDCx tokens in their account vault. To redeem them for USDC, they create a `UsdcxBurnNote` - a public note containing the tokens to destroy plus the destination for USDC release.
 
 ```rust
-let burn_note = BurnNote::create(sender, faucet_id, fungible_asset, attachments, rng)?;
-// BurnNote is always NoteType::Public (observable on-chain for audit trail)
-// The asset is moved from the user's vault INTO the note
+let burn_note = UsdcxBurnNote::create(
+    sender, faucet_id, fungible_asset,
+    destination_domain,       // e.g. 0 = Ethereum
+    &destination_recipient,   // 32-byte address on destination chain
+    rng,
+)?;
+// Always NoteType::Public (observable on-chain for audit trail)
+// Storage: [destination_domain, destination_recipient(8 u32 felts)]
 ```
 
-The BurnNote's script calls `receive_and_burn` on the faucet:
+The note's script calls `receive_and_burn` on the faucet. The destination data lives in the note's public storage (readable by the withdrawal service and auditors):
 
 ```masm
 @note_script
 pub proc main
     dropw
-    call.::miden::standards::faucets::fungible::receive_and_burn
+    call.faucet::receive_and_burn
 end
 ```
 
@@ -291,7 +296,7 @@ Intentional adaptations to Miden's architecture. Each should be flagged to Circl
 | Attester lookup | Address-based (`bytes20`) | PK_COMM-based (Poseidon2 hash of compressed pubkey) | Miden's `ecdsa_k256_keccak::verify` takes PK_COMM on the stack, not raw addresses. Equivalent security - the commitment uniquely identifies the key. |
 | Balance storage | Contract-internal mapping | Per-account asset vaults | Miden's UTXO-like model stores balances in each account, not centrally in the faucet. The faucet tracks totalSupply; individual balances are in vaults. |
 | Event emission | Solidity events | Output notes + transaction records | Miden has no event log. Output notes are the observable artifacts. All mint/burn data is recoverable from the transaction and note metadata. |
-| Burn destination | On-chain parameters (`destinationDomain`, `destinationRecipient`) | Off-chain communication to relayer | BurnNote doesn't carry cross-chain routing info. Destination communicated to the withdrawal service off-chain. |
+| Burn destination | On-chain parameters (`destinationDomain`, `destinationRecipient`) | Public note storage on `UsdcxBurnNote` | `[destination_domain, destination_recipient(8)]` stored in the note's public storage. Readable by the withdrawal service directly from the chain. |
 | Transfer restrictions | Not in Circle's base spec | Blocklist on send+receive via `BasicBlocklist` | Added for OFAC/sanctions compliance. Not required by Circle but expected by regulators. |
 | Pausability | Not in Circle's base spec | `Pausable` component halts all operations | Added for operational safety. Common in regulated stablecoin contracts. |
 
@@ -333,6 +338,7 @@ miden-usdcx/
         faucet.rs               # create_usdcx_faucet() - composes all components
         mint_policy.rs          # UsdcxMintPolicy - MASM attestation-gated mint
         burn_policy.rs          # UsdcxBurnPolicy - MASM minBurnSize enforcement
+        burn_note.rs            # UsdcxBurnNote - custom burn note with destination storage
         attester_registry.rs    # AttesterRegistry - approved attester PK_COMMs
         nonce_registry.rs       # NonceRegistry - replay protection
         domain_config.rs        # DomainConfig - domain ID + minBurnSize
@@ -360,43 +366,44 @@ miden-usdcx/
 
 ```bash
 cargo check --workspace        # Type check
-cargo test --workspace         # Run all 34 tests
+cargo test --workspace         # Run all 45 tests
 ```
 
 ## Test Results
 
-All 36 tests passing (6 unit + 23 faucet integration + 7 relayer integration).
+All 45 tests passing (6 unit + 32 faucet integration + 7 relayer integration).
 
 | Category | Tests | Status |
 |---|---|---|
 | **Unit (bytes32 encoding)** | `bytes32_roundtrip`, `bytes32_zero`, `bytes32_max_u32`, `bytes32_individual_limbs`, `bytes32_key_deterministic`, `bytes32_previously_overflowing_now_works` | 6/6 pass |
 | **Faucet creation** | `faucet_creation_succeeds`, `faucet_has_correct_domain_config`, `faucet_has_initial_attester` | 3/3 pass |
-| **Mint (attestation)** | `mint_with_valid_attestation_succeeds`, `mint_with_unknown_attester_fails`, `mint_nonce_replay_fails`, `mint_wrong_domain_fails`, `mint_while_paused_fails`, `mint_zero_amount_fails`, `mint_fee_exceeds_max_fee_fails` | 7/7 pass |
-| **Burn** | `burn_above_min_succeeds`, `burn_below_min_fails`, `burn_min_size_update_enforced`, `burn_while_paused_fails` | 4/4 pass |
+| **Mint (attestation)** | `mint_with_valid_attestation_succeeds`, `mint_with_unknown_attester_fails`, `mint_nonce_replay_fails`, `mint_wrong_domain_fails`, `mint_while_paused_fails`, `mint_zero_amount_fails`, `mint_fee_exceeds_max_fee_fails`, `mint_invalid_magic_fails`, `mint_invalid_version_fails`, `mint_wrong_remote_token_fails`, `mint_zero_local_token_fails`, `mint_zero_local_depositor_fails`, `mint_amount_below_max_fee_fails` | 13/13 pass |
+| **Burn** | `burn_above_min_succeeds`, `burn_below_min_fails`, `burn_min_size_update_enforced`, `burn_while_paused_fails`, `burn_note_contains_destination_storage`, `burn_note_different_destinations`, `burn_with_destination_storage_succeeds` | 7/7 pass |
 | **Admin** | `owner_can_add_attester`, `owner_can_remove_attester`, `owner_can_set_min_burn_size`, `non_owner_cannot_add_attester`, `pause_unpause_cycle`, `ownership_transfer_two_step` | 6/6 pass |
 | **Blocklist** | `blocked_account_transfer_rejected`, `unblocked_account_transfer_succeeds`, `non_owner_blocklist_fails` | 3/3 pass |
 | **Relayer** | `deposit_poll_returns_sample_event`, `deposit_attestation_fetch_and_tx_build`, `tx_script_compiles_with_various_amounts`, `withdrawal_poll_returns_sample_event`, `withdrawal_full_lifecycle`, `withdrawal_rejects_insufficient_signers`, `deposit_to_withdrawal_full_pipeline` | 7/7 pass |
 
 ## Current Status
 
-- ECDSA secp256k1 attestation verification fully implemented in `check_policy` (attester registry lookup, nonce replay protection, fee limit enforcement, domain-bound message verification via `ecdsa_k256_keccak::verify`)
-- Attestation message format: `merge(NONCE, [amount, domain_id, max_fee, 0])` - includes fee cap signed by attester
-- `mint_with_attestation` procedure implemented with fee-splitting mint (two output notes: recipient + relayer)
+- All 10 Circle mint() preconditions verified on-chain in MASM `check_policy` (magic, version, amount > 0, remoteDomain, remoteToken, localToken/localDepositor != 0, amount >= maxFee, maxFee >= feeAmount, nonce unused, ECDSA signature)
+- Full depositIntent parsing: all fields read from advice stack and validated on-chain
+- Attestation message: `Poseidon2::hash_elements` over all 39 depositIntent felts
+- `xreserve_mint` procedure implemented with fee-splitting mint (two output notes: recipient + relayer)
+- Custom `UsdcxBurnNote` with public storage: `[destination_domain, destination_recipient(8)]` for withdrawal service visibility
 - Burn policy fully functional with minBurnSize enforcement and owner-gated configuration
 - Blocklist enforcement tested end-to-end (block, unblock, non-owner rejection)
 - Two-step ownership transfer tested (nominate + accept)
 - Pause/unpause cycle tested across mint and burn flows
 - Off-chain relayer with trait-based `CircleApi` (real HTTP client + `MockCircleApi` for testing)
-- Relayer `build_mint_transaction` compiles real MASM tx scripts and constructs real advice maps (attestation data + ECDSA signature entries matching the on-chain `check_policy` layout)
-- Safe `bytes32_to_felts` encoding (8 u32 felts per bytes32, AggLayer convention) with `bytes32_to_key` for Poseidon2 hashing to Word
+- Relayer `build_mint_transaction` compiles real MASM tx scripts and constructs real advice maps
+- Safe `bytes32_to_felts` encoding (8 u32 felts per bytes32, AggLayer convention)
 
 ## Next Steps
 
-1. Wire `mint_with_attestation` into integration tests (fee-split flow with two output notes)
-2. Connect relayer to real Ethereum RPC (ethers/alloy) for deposit event polling
-3. Connect relayer to Miden node RPC for account state fetch and transaction proving
-4. Circle domain ID assignment for Miden
-5. End-to-end testnet deployment
+1. Connect relayer to real Ethereum RPC (ethers/alloy) for deposit event polling
+2. Connect relayer to Miden node RPC for account state fetch and transaction proving
+3. Circle domain ID assignment for Miden
+4. End-to-end testnet deployment
 
 ## Design Spec
 
