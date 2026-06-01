@@ -2,7 +2,10 @@
 //!
 //! These tests exercise the full deposit and withdrawal pipelines with
 //! canned data - no real Ethereum RPC, Miden node, or Circle credentials needed.
+//! The tx script compilation and advice map construction are REAL - only the
+//! chain polling and account state fetch remain mocked.
 
+use miden_protocol::{Felt, Word, ZERO};
 use usdcx_relayer::circle_api::{CircleApi, MockCircleApi};
 use usdcx_relayer::config::RelayerConfig;
 use usdcx_relayer::deposit_monitor::DepositMonitor;
@@ -28,9 +31,37 @@ struct TestSigner {
 
 impl BurnIntentSigner for TestSigner {
     fn sign(&self, encoded_batch: &[u8]) -> Result<Vec<u8>, SignerError> {
-        // Deterministic: hash of (signer_id, batch_len)
         Ok(vec![self.id, encoded_batch.len() as u8, 0xAB, 0xCD])
     }
+}
+
+/// Sample values for tx construction tests. In production these come from
+/// parsing the Circle attestation.
+fn sample_pk_comm() -> Word {
+    Word::new([
+        Felt::new_unchecked(1111),
+        Felt::new_unchecked(2222),
+        Felt::new_unchecked(3333),
+        Felt::new_unchecked(4444),
+    ])
+}
+
+fn sample_nonce() -> Word {
+    Word::new([
+        Felt::new_unchecked(100),
+        Felt::new_unchecked(200),
+        Felt::new_unchecked(300),
+        Felt::new_unchecked(400),
+    ])
+}
+
+fn sample_recipient() -> Word {
+    Word::new([
+        Felt::new_unchecked(10),
+        Felt::new_unchecked(20),
+        Felt::new_unchecked(30),
+        Felt::new_unchecked(40),
+    ])
 }
 
 // DEPOSIT PIPELINE TESTS
@@ -60,14 +91,54 @@ async fn deposit_attestation_fetch_and_tx_build() {
     assert_eq!(attestation.deposit_message_hash, hash);
     assert!(!attestation.attestation.is_empty());
 
-    // Build mint transaction
-    let tx = monitor.build_mint_transaction(deposit, attestation).await.unwrap();
-    assert!(!tx.tx_bytes.is_empty());
+    // Build mint transaction with real tx script compilation and advice map
+    let tx = monitor.build_mint_transaction(
+        &deposit,
+        &attestation,
+        sample_pk_comm(),
+        sample_nonce(),
+        Felt::new_unchecked(0xABCD), // faucet prefix
+        Felt::new_unchecked(0x1234), // faucet suffix
+        sample_recipient(),
+        vec![ZERO; 4], // mock prepared signature
+        0,             // fee_amount
+        0,             // max_fee
+    ).unwrap();
 
-    // Verify the transaction payload contains expected fields
-    let payload = String::from_utf8(tx.tx_bytes).unwrap();
-    assert!(payload.contains("mint:faucet="));
-    assert!(payload.contains("amount=1000000"));
+    // The tx script is real compiled MASM
+    assert!(tx.tx_script_code.contains("mint_and_send"));
+    assert!(tx.tx_script_code.contains("create_fungible_asset"));
+    assert_eq!(tx.amount, 1_000_000);
+}
+
+#[tokio::test]
+async fn tx_script_compiles_with_various_amounts() {
+    let monitor = DepositMonitor::new(test_config(), MockCircleApi);
+    let attestation = MockCircleApi.get_attestation("test").await.unwrap();
+
+    for amount in [1u64, 1_000, 1_000_000, 100_000_000] {
+        let deposit = usdcx_relayer::deposit_monitor::DepositEvent {
+            tx_hash: "0xtest".into(),
+            deposit_message_hash: "0xtest".into(),
+            amount,
+            recipient: "0xrecipient".into(),
+        };
+
+        let tx = monitor.build_mint_transaction(
+            &deposit,
+            &attestation,
+            sample_pk_comm(),
+            sample_nonce(),
+            Felt::new_unchecked(0xABCD),
+            Felt::new_unchecked(0x1234),
+            sample_recipient(),
+            vec![ZERO; 4],
+            0,
+            0,
+        ).unwrap();
+
+        assert_eq!(tx.amount, amount);
+    }
 }
 
 // WITHDRAWAL PIPELINE TESTS
@@ -116,7 +187,6 @@ async fn withdrawal_rejects_insufficient_signers() {
         destination_recipient: "0xBobOnEthereum".into(),
     };
 
-    // Only 1 signer - should fail (Circle requires minimum 2)
     let signer_a = TestSigner { id: 1 };
     let signers: Vec<&dyn BurnIntentSigner> = vec![&signer_a];
 
@@ -130,12 +200,9 @@ async fn withdrawal_rejects_insufficient_signers() {
 
 #[tokio::test]
 async fn deposit_to_withdrawal_full_pipeline() {
-    // Simulate the full relayer pipeline: deposit detected -> attestation fetched ->
-    // mint tx built -> (later) burn detected -> withdrawal processed
-
     let config = test_config();
 
-    // --- Deposit side ---
+    // --- Deposit side: poll -> fetch attestation -> build real tx ---
     let deposit_monitor = DepositMonitor::new(config.clone(), MockCircleApi);
 
     let deposits = deposit_monitor.poll_deposits().await.unwrap();
@@ -146,13 +213,25 @@ async fn deposit_to_withdrawal_full_pipeline() {
         .get_attestation(&deposit.deposit_message_hash)
         .await
         .unwrap();
-    let mint_tx = deposit_monitor
-        .build_mint_transaction(deposit, attestation)
-        .await
-        .unwrap();
-    assert!(!mint_tx.tx_bytes.is_empty());
 
-    // --- Withdrawal side ---
+    let mint_tx = deposit_monitor.build_mint_transaction(
+        &deposit,
+        &attestation,
+        sample_pk_comm(),
+        sample_nonce(),
+        Felt::new_unchecked(0xABCD),
+        Felt::new_unchecked(0x1234),
+        sample_recipient(),
+        vec![ZERO; 4],
+        0,
+        0,
+    ).unwrap();
+
+    // Verify the tx is real: compiled MASM script + advice inputs
+    assert!(mint_tx.tx_script_code.contains("mint_and_send"));
+    assert_eq!(mint_tx.amount, 1_000_000);
+
+    // --- Withdrawal side: poll -> prepare -> multi-sig -> submit -> finalize ---
     let withdrawal_service = WithdrawalService::new(config, MockCircleApi);
 
     let burns = withdrawal_service.poll_burns().await.unwrap();

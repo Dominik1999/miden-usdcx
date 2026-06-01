@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 usdcx-faucet = { workspace = true }
 miden-protocol = { workspace = true }
+miden-standards = { workspace = true }
 anyhow = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }

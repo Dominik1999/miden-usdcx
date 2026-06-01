@@ -1,8 +1,29 @@
+use std::sync::Arc;
+
+use miden_protocol::assembly::DefaultSourceManager;
+use miden_protocol::note::NoteType;
+use miden_protocol::vm::AdviceInputs;
+use miden_protocol::{Felt, Hasher, Word, ZERO};
+use miden_standards::code_builder::CodeBuilder;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
 use crate::circle_api::{Attestation, CircleApi, CircleApiError};
 use crate::config::RelayerConfig;
+
+// CONSTANTS
+// ================================================================================================
+
+/// Well-known advice map key for attestation data, must match the MASM constant.
+const ATTESTATION_DATA_KEY: Word = Word::new([
+    Felt::new_unchecked(3735928559),
+    Felt::new_unchecked(3405691582),
+    Felt::new_unchecked(3735928559),
+    Felt::new_unchecked(3405691582),
+]);
+
+// TYPES
+// ================================================================================================
 
 /// An on-chain deposit event detected on the source chain.
 #[derive(Debug, Clone)]
@@ -13,11 +34,21 @@ pub struct DepositEvent {
     pub recipient: String,
 }
 
-/// A Miden transaction that mints USDCx to a recipient.
+/// A prepared Miden mint transaction ready for proving and submission.
 #[derive(Debug, Clone)]
 pub struct MintTransaction {
-    pub tx_bytes: Vec<u8>,
+    /// The compiled transaction script source (MASM).
+    pub tx_script_code: String,
+    /// Advice inputs containing attestation data and ECDSA signature.
+    pub advice_inputs: AdviceInputs,
+    /// The faucet account ID this transaction targets.
+    pub faucet_account_id: String,
+    /// The deposit amount being minted.
+    pub amount: u64,
 }
+
+// DEPOSIT MONITOR
+// ================================================================================================
 
 /// Monitors the source chain for xReserve deposit events and builds corresponding
 /// mint transactions for the Miden faucet.
@@ -49,15 +80,14 @@ impl<C: CircleApi> DepositMonitor<C> {
 
         // TODO(production): replace with real Ethereum RPC query via ethers/alloy:
         //   1. provider.get_logs(filter) on the xReserve contract
-        //   2. Decode DepositForBurn(nonce, burnToken, amount, depositor,
-        //      mintRecipient, destinationDomain, ...) events
+        //   2. Decode DepositForBurn events
         //   3. Filter for destinationDomain == self.config.domain_id
         //   4. Track last processed block to avoid reprocessing
 
         let sample = DepositEvent {
             tx_hash: "0xabc123def456789...sample".into(),
             deposit_message_hash: "0xdeadbeef00000000000000000000000000000000000000000000000000000001".into(),
-            amount: 1_000_000, // 1 USDC (6 decimals)
+            amount: 1_000_000,
             recipient: self.config.faucet_account_id.clone(),
         };
 
@@ -67,52 +97,113 @@ impl<C: CircleApi> DepositMonitor<C> {
 
     /// Build a Miden mint transaction from a deposit event and its Circle attestation.
     ///
-    /// Production: uses miden-tx to construct and prove a transaction that calls
-    /// `mint_with_attestation` on the faucet with the attestation in the advice map.
+    /// Constructs the real transaction script (MASM) and advice map needed to call
+    /// `mint_and_send` on the faucet with attestation verification. The returned
+    /// `MintTransaction` contains everything needed to execute and prove the
+    /// transaction once the faucet account state is available.
     ///
-    /// Current: returns a representative transaction payload so the submission
-    /// pipeline is exercised.
-    pub async fn build_mint_transaction(
+    /// The transaction script and advice inputs follow the same pattern as the
+    /// integration tests: the tx script calls `create_fungible_asset` then
+    /// `mint_and_send`, while `check_policy` reads PK_COMM, NONCE, fee data,
+    /// and the ECDSA signature from the advice map.
+    pub fn build_mint_transaction(
         &self,
-        deposit: DepositEvent,
-        attestation: Attestation,
+        deposit: &DepositEvent,
+        _attestation: &Attestation,
+        pk_comm: Word,
+        nonce: Word,
+        faucet_id_prefix: Felt,
+        faucet_id_suffix: Felt,
+        recipient: Word,
+        prepared_signature: Vec<Felt>,
+        fee_amount: u64,
+        max_fee: u64,
     ) -> Result<MintTransaction, DepositMonitorError> {
         info!(
             tx_hash = %deposit.tx_hash,
             amount = deposit.amount,
             recipient = %deposit.recipient,
-            attestation_hash = %attestation.deposit_message_hash,
-            "building mint transaction for deposit"
+            "building mint transaction"
         );
 
-        // TODO(production): replace with real miden-tx transaction construction:
-        //   1. Parse Circle attestation -> extract PK_COMM, NONCE, ECDSA signature
-        //   2. Build advice map:
-        //      - ATTESTATION_DATA_KEY -> [PK_COMM(4), NONCE(4), fee_amount, max_fee, 0, 0]
-        //      - merge(PK_COMM, MESSAGE) -> prepared ECDSA signature
-        //   3. Build tx script calling mint_and_send on the faucet
-        //   4. Execute transaction against faucet account state
-        //   5. Prove the transaction
-        //   6. Serialize proven transaction
+        // 1. Build the transaction script (real MASM, same as integration tests)
+        let tag: u32 = 0; // TODO(production): NoteTag::with_account_target(recipient_account_id)
+        let note_type = NoteType::Private;
 
-        let tx_payload = format!(
-            "mint:faucet={},amount={},recipient={},attestation={}",
-            self.config.faucet_account_id,
-            deposit.amount,
-            deposit.recipient,
-            attestation.deposit_message_hash,
+        let tx_script_code = format!(
+            r#"
+            begin
+                push.{recipient}
+                push.{note_type}
+                push.{tag}
+                push.{amount}
+                push.{faucet_id_prefix}
+                push.{faucet_id_suffix}
+                push.1
+                exec.::miden::protocol::asset::create_fungible_asset
+                call.::miden::standards::faucets::fungible::mint_and_send
+                dropw dropw dropw dropw
+            end
+            "#,
+            recipient = recipient,
+            note_type = note_type as u8,
+            tag = tag,
+            amount = deposit.amount,
+            faucet_id_prefix = faucet_id_prefix,
+            faucet_id_suffix = faucet_id_suffix,
         );
 
-        info!(payload_size = tx_payload.len(), "mint transaction built");
+        // Verify the script compiles
+        let source_manager = Arc::new(DefaultSourceManager::default());
+        let _tx_script = CodeBuilder::with_source_manager(source_manager)
+            .compile_tx_script(&tx_script_code)
+            .map_err(|e| DepositMonitorError::BuildTransaction(format!("MASM compile error: {e}")))?;
+
+        debug!("transaction script compiled successfully");
+
+        // 2. Build the advice map (real, same as integration tests)
+        let message = deposit_message(nonce, deposit.amount, self.config.domain_id, max_fee);
+        let sig_key = Hasher::merge(&[pk_comm, message]);
+
+        let mut attestation_data: Vec<Felt> = Vec::new();
+        attestation_data.extend(pk_comm.as_elements());
+        attestation_data.extend(nonce.as_elements());
+        attestation_data.push(Felt::new_unchecked(fee_amount));
+        attestation_data.push(Felt::new_unchecked(max_fee));
+        attestation_data.push(ZERO);
+        attestation_data.push(ZERO);
+
+        let advice_inputs = AdviceInputs::default()
+            .with_map([
+                (ATTESTATION_DATA_KEY, attestation_data),
+                (sig_key, prepared_signature),
+            ]);
+
+        info!(
+            script_len = tx_script_code.len(),
+            "mint transaction built with real tx script and advice map"
+        );
+
+        // 3. Return the prepared transaction
+        // To execute and prove, the caller needs the faucet account state from
+        // the Miden node. That's the remaining integration point:
+        //   let tx_context = miden_client
+        //       .build_tx_context(faucet_id, &[], &[])
+        //       .tx_script(compiled_script)
+        //       .extend_advice_inputs(advice_inputs)
+        //       .build()?;
+        //   let executed = tx_context.execute().await?;
+        //   let proven = tx_context.prove(executed)?;
+
         Ok(MintTransaction {
-            tx_bytes: tx_payload.into_bytes(),
+            tx_script_code,
+            advice_inputs,
+            faucet_account_id: self.config.faucet_account_id.clone(),
+            amount: deposit.amount,
         })
     }
 
     /// Run the deposit monitoring loop.
-    ///
-    /// Polls for deposits, fetches attestations from Circle, and builds mint
-    /// transactions in a continuous loop.
     pub async fn run(&self) -> Result<(), DepositMonitorError> {
         let interval = std::time::Duration::from_secs(self.config.deposit_poll_interval_secs);
         info!(
@@ -131,25 +222,18 @@ impl<C: CircleApi> DepositMonitor<C> {
                         let hash = deposit.deposit_message_hash.clone();
                         match self.circle_client.get_attestation(&hash).await {
                             Ok(attestation) => {
-                                match self.build_mint_transaction(deposit, attestation).await {
-                                    Ok(tx) => {
-                                        info!(
-                                            tx_size = tx.tx_bytes.len(),
-                                            "mint transaction built, ready for submission"
-                                        );
-                                        // Production: submit tx to Miden node
-                                    }
-                                    Err(e) => {
-                                        warn!(error = %e, "failed to build mint transaction");
-                                    }
-                                }
+                                info!(
+                                    hash = %attestation.deposit_message_hash,
+                                    "attestation fetched, ready to build transaction"
+                                );
+                                // In production: parse attestation to extract PK_COMM,
+                                // NONCE, and prepared ECDSA signature, then call
+                                // build_mint_transaction with real values and submit
+                                // the proven transaction to the Miden node.
+                                let _ = attestation;
                             }
                             Err(e) => {
-                                warn!(
-                                    hash,
-                                    error = %e,
-                                    "failed to fetch attestation, will retry"
-                                );
+                                warn!(hash, error = %e, "failed to fetch attestation, will retry");
                             }
                         }
                     }
@@ -164,13 +248,32 @@ impl<C: CircleApi> DepositMonitor<C> {
     }
 }
 
+// HELPERS
+// ================================================================================================
+
+/// Compute the deposit message: merge(NONCE, [amount, domain_id, max_fee, 0]).
+///
+/// This must match the MASM computation in check_policy.
+fn deposit_message(nonce: Word, amount: u64, domain_id: u32, max_fee: u64) -> Word {
+    let amount_word = Word::new([
+        Felt::new_unchecked(amount),
+        Felt::new_unchecked(domain_id as u64),
+        Felt::new_unchecked(max_fee),
+        ZERO,
+    ]);
+    Hasher::merge(&[nonce, amount_word])
+}
+
+// ERRORS
+// ================================================================================================
+
 /// Errors produced by the deposit monitor.
 #[derive(Debug, Error)]
 pub enum DepositMonitorError {
     #[error("Circle API error: {0}")]
     CircleApi(#[from] CircleApiError),
 
-    #[error("Failed to build mint transaction: {0}")]
+    #[error("failed to build mint transaction: {0}")]
     BuildTransaction(String),
 
     #[error("RPC error: {0}")]
